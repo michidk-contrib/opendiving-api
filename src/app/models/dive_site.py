@@ -1,6 +1,6 @@
-from datetime import date
+from datetime import date, datetime
 
-from sqlalchemy import JSON, CheckConstraint, Date, Float, ForeignKey, Index, Integer, String, func
+from sqlalchemy import JSON, CheckConstraint, Date, DateTime, Float, ForeignKey, Index, Integer, String, func
 from sqlalchemy.orm import Mapped, declared_attr, mapped_column
 
 from ..core.db.database import Base
@@ -17,7 +17,8 @@ class DiveSite(Base, PublicUUIDMixin, TimestampMixin):
     user_id: Mapped[int | None] = mapped_column(ForeignKey("user.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(255))
     # Two plain floats rather than PostGIS: a dive site is a point, and the only questions
-    # asked of it are "show it" and "list them" - see DECISIONS.md.
+    # asked of it are "show it", "list them" and which Commons records lie near it, which a
+    # range over the two columns answers - see DECISIONS.md.
     latitude: Mapped[float | None] = mapped_column(Float, default=None)
     longitude: Mapped[float | None] = mapped_column(Float, default=None)
     # The locality, flat and prefixed: the same place object a trip part carries
@@ -58,6 +59,11 @@ class DiveSite(Base, PublicUUIDMixin, TimestampMixin):
     commons_seed_registry: Mapped[str | None] = mapped_column(String(255), default=None)
     commons_seed_identifier: Mapped[str | None] = mapped_column(String(255), default=None)
     commons_retrieved: Mapped[date | None] = mapped_column(Date, default=None)
+    # When a review last wrote this row, and the mark the sync leaves alone whatever
+    # `COMMONS_PRIMARY` says: a primary that restarts without its setting must not hand an
+    # accepted change back to the bundle. On the row rather than read off the proposals, which
+    # an account's deletion takes. This instance's own, so nothing publishes it.
+    commons_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
     @declared_attr.directive
     @classmethod
