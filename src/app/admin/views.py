@@ -136,12 +136,14 @@ def register_admin_views(admin: CRUDAdmin) -> None:
     # every join row pointing at it, through the FK cascades. It would do that with **no
     # cache invalidation**: that lives on the API routes (`services/cache_invalidation.py`)
     # and nowhere else, so Redis would go on serving the deleted rows for the rest of the
-    # TTL. Delete through the API. `view`/`create`/`update` are unaffected.
+    # TTL. Delete through the API. `view` and `update` are unaffected, and so is `create`, but for
+    # `DiveSite`: a site is written with its owner's `saved_site` row, which this form has no way
+    # to add, and one without it is on nobody's list.
     admin.add_view(
         model=DiveSite,
         create_schema=DiveSiteCreateInternal,
         update_schema=DiveSiteUpdate,
-        allowed_actions={"view", "create", "update"},
+        allowed_actions={"view", "update"},
     )
 
     admin.add_view(
