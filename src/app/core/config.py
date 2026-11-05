@@ -370,6 +370,19 @@ class RegistrationSettings(BaseSettings):
     # every place the app knows who runs it.
     PROJECT_OPERATED: bool = config("PROJECT_OPERATED", default=False)
 
+    # **Whether this instance is the one where OpenDiving Commons is edited.** Off, a copy: the
+    # Commons rows follow the bundle the image ships. On, the table is the truth, the bundle
+    # only seeds it, and `GET /commons/dive-sites` serves it. Off is what a missing variable
+    # gives, so nothing an operator forgets can publish anything. `PROJECT_OPERATED` is not this
+    # switch: that one selects copy, and this one reaches rows and routes.
+    COMMONS_PRIMARY: bool = config("COMMONS_PRIMARY", default=False)
+
+    # What one address may ask of `GET /commons/dive-sites`, the whole pool per request. The
+    # publish fetches it daily, so the bound is on a scraper rather than on any caller meant to
+    # be here.
+    COMMONS_EXPORT_RATE_LIMIT_WINDOW_SECONDS: int = config("COMMONS_EXPORT_RATE_LIMIT_WINDOW_SECONDS", default=3600)
+    COMMONS_EXPORT_RATE_LIMIT_PER_IP: int = config("COMMONS_EXPORT_RATE_LIMIT_PER_IP", default=20)
+
     # `slug=Label` pairs, comma-separated: each one a link, `/join?via=<slug>`, that admits
     # whoever follows it without an invitation and counts the account under its slug. Empty
     # is the default and turns the feature off everywhere - the resolve route 404s, `GET
