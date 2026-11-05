@@ -11,6 +11,8 @@ Same skip-if-unreachable guard and same write-real-rows-and-leave-them conventio
 
 import hashlib
 import io
+import sys
+import time
 import uuid as uuid_pkg
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
 from src.app.api.v1 import dives as dives_module
-from src.app.api.v1.dives import erase_dive_recording, patch_dive_recording
+from src.app.api.v1.dives import _cached_read_dive, erase_dive_recording, patch_dive_recording, write_dive_recording
 from src.app.core.security import create_dive_file_token
 from src.app.core.utils.datetime_offset import combine_start_time
 from src.app.models.dive import Dive
@@ -36,7 +38,7 @@ from src.app.models.user import User
 from src.app.schemas.dive import DecoAlgorithm, DiveListSort, DiveMode, DiveRead, RecordingUpdateRequest
 from src.app.schemas.dive_profile import ProfileProvenance
 from src.app.schemas.parsed_dive import ParsedDecoModel
-from src.app.services import blob_store
+from src.app.services import blob_store, libdivecomputer
 from src.app.services.dive_files import (
     delete_dive_file,
     fill_tech_scalars,
@@ -53,6 +55,7 @@ from src.app.services.dive_recordings import (
     next_ordinal,
     renumber_ordinals,
 )
+from src.app.services.libdivecomputer import LIBDIVECOMPUTER
 from tests.conftest import db_available
 from tests.helpers.dive_files import suunto_json
 from tests.helpers.generators import create_dive, create_dive_recording, create_user
@@ -1319,6 +1322,47 @@ class TestReadingUnreadFixes:
         assert fixes_read is True
         assert await _dive_fixes(async_db, dive) == (DOCUMENT, OCEAN_EXIT)
 
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(sys.platform != "linux", reason="the reader's address-space ceiling is set the Linux way")
+    async def test_an_original_whose_reader_never_returns_costs_one_timeout_and_is_marked_read(
+        self,
+        volume: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        async_db: AsyncSession,
+        diver: User,
+        dive: Dive,
+        tmp_path: Path,
+    ) -> None:
+        """A vendored parser can loop for ever on a crafted buffer. The read is stopped at the
+        timeout and the file marked read, so the batch commits and is not selected again."""
+        monkeypatch.setattr("src.app.services.cache_invalidation.invalidate_dive_caches", AsyncMock())
+        stand_in = tmp_path / "divejson-raw"
+        stand_in.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(600)\n")
+        stand_in.chmod(0o755)
+        monkeypatch.setattr(libdivecomputer, "_installed", lambda: (str(stand_in), "0.0.0+stand-in"))
+        monkeypatch.setattr(libdivecomputer, "TIMEOUT_SECONDS", 0.5)
+        await _attach_as(async_db, diver, dive, OCEAN_JSON, "suunto_json")
+        await self._unread(
+            async_db,
+            dive,
+            parser_key=LIBDIVECOMPUTER,
+            descriptor_vendor="Suunto",
+            descriptor_product="Ocean",
+            descriptor_model=1,
+        )
+        started = time.monotonic()
+
+        # Looped as the worker loops: the database is shared, and other tests' unread files
+        # may be in the same batch.
+        while await read_unread_file_fixes(async_db, limit=50) == 50:
+            pass
+
+        assert time.monotonic() - started < 30
+        fixes_read = (
+            await async_db.execute(select(DiveFile.fixes_read).where(DiveFile.dive_id == dive.id))
+        ).scalar_one()
+        assert fixes_read is True
+
 
 class TestOrdinals:
     @pytest.mark.asyncio
@@ -1478,3 +1522,48 @@ class TestTheDiveList:
 
         counts = {row["uuid"]: row["recording_count"] for row in page["data"]}
         assert counts == {dive.uuid: 2, hand_logged.uuid: 0}
+
+
+class TestTheDiveAxis:
+    """`start_on_dive_axis` through the routes that answer with a recording: the attach
+    route's own answer, and the dive read after it."""
+
+    @pytest.fixture
+    def attaching(self, monkeypatch: pytest.MonkeyPatch, routed: None) -> None:
+        monkeypatch.setattr(dives_module, "enforce_rate_limit", AsyncMock())
+        monkeypatch.setattr(dives_module, "invalidate_gear_caches", AsyncMock())
+
+    @staticmethod
+    async def _attach_through_the_route(db: AsyncSession, diver: User, dive: Dive, content: bytes) -> Any:
+        return await write_dive_recording(
+            request=Mock(),
+            uuid=dive.uuid,
+            current_user={"id": diver.id, "uuid": diver.uuid, "is_superuser": False},
+            db=db,
+            file=UploadFile(filename="export.json", file=io.BytesIO(content)),
+            file_token=create_dive_file_token(
+                user_uuid=diver.uuid, sha256=hashlib.sha256(content).hexdigest(), parser_key="suunto_json"
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_attaching_an_earlier_computer_moves_the_primary_on_the_next_read(
+        self, volume: Any, async_db: AsyncSession, diver: User, dive: Dive, attaching: None
+    ) -> None:
+        samples = _samples((0, "0"), (10, "5"))
+        first = await self._attach_through_the_route(async_db, diver, dive, _export(samples=samples))
+        assert first.start_on_dive_axis == 0
+
+        earlier = _export(start="2026-09-08T15:17:08.670+03:00", samples=samples).replace(
+            b"253810000400", b"999999999999"
+        )
+        second = await self._attach_through_the_route(async_db, diver, dive, earlier)
+        assert second.start_on_dive_axis == 0
+
+        read = await _cached_read_dive.__wrapped__(  # type: ignore[attr-defined]
+            request=None, user_id=diver.id, uuid=dive.uuid, owner_uuid=diver.uuid, db=async_db
+        )
+        assert [(row.uuid, row.start_on_dive_axis) for row in read.recordings] == [
+            (first.uuid, 30_000),
+            (second.uuid, 0),
+        ]

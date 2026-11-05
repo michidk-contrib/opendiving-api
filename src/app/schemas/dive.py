@@ -630,9 +630,20 @@ class DiveListItem(DiveRead):
             "when there is none to draw",
         ),
     ]
+    deco: Annotated[
+        bool,
+        Field(
+            description="Whether the recording the dive page charts held the diver to a decompression ceiling; false "
+            "when the dive has no profile"
+        ),
+    ]
     recording_count: Annotated[
         int,
         Field(ge=0, description="How many recordings the dive holds, as the dive page lists them; 0 when it has none"),
+    ]
+    species_count: Annotated[
+        int,
+        Field(ge=0, description="How many distinct species the dive's sightings name; 0 when it has none"),
     ]
     tags: Annotated[list[str], Field(default_factory=list, description="The dive's tags, in the diver's order")]
 
@@ -794,8 +805,9 @@ class RecordingDecoModel(BaseModel):
 
 
 class RecordingRead(RecordingReadouts):
-    """One device's record of a dive: what recorded it, how it was set, when it started, what
-    it reported, its files and a summary of its samples.
+    """One device's record of a dive: what recorded it, how it was set, when it started and
+    where that falls among the dive's other recordings, what it reported, its files and a
+    summary of its samples.
 
     Ordered by `ordinal` within a dive, and **0 is primary** - the recording a single-profile
     consumer takes, the one whose readouts the dive page and the CSV show, and the one the
@@ -849,6 +861,17 @@ class RecordingRead(RecordingReadouts):
             "legitimately differs from. Offset-less where the source recorded no offset, exactly as a dive's is. The "
             "profile's `times` are elapsed milliseconds from this instant. Null where nothing stated one - which on a "
             "dive whose start is a bare date means its axis counts from an unknown time that day.",
+        ),
+    ]
+    start_on_dive_axis: Annotated[
+        int | None,
+        Field(
+            default=None,
+            examples=[93520],
+            description="Where this recording's own 0 lies on one time axis the dive's recordings share, in "
+            "milliseconds from the start of the earliest of them, so adding it to the profile's `times`, "
+            "`dive_end_time` and event `time`s places them on that axis. Null where this recording has no samples, "
+            "no start, or a start too far from that of the dive's first recording with both to share its axis.",
         ),
     ]
     files: Annotated[
