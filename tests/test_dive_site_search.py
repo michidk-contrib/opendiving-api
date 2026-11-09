@@ -588,13 +588,92 @@ class TestYourSites:
         _dive_at(db, diver, dived, datetime(2026, 5, 1, tzinfo=UTC), max_depth=24.0)
         create_commons_site(db)
 
-        body = await _search(http, yours="true", latitude=1.0, longitude=1.0, **_view(1.0, 1.0))
+        body = await _search(http, my="true", latitude=1.0, longitude=1.0)
 
         assert [row["uuid"] for row in body["rows"]] == [str(dived.uuid), str(pinless.uuid)]
         assert body["total_count"] == 2
         assert body["rows"][0]["dives"]["dive_count"] == 1
         assert body["rows"][0]["dives"]["max_dive_depth"] == 24.0
         assert body["rows"][1]["dives"]["dive_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_without_text_a_view_keeps_the_pinned_ones_inside_it_last_dived_first(
+        self, http: httpx.AsyncClient, db: Session, diver: User
+    ) -> None:
+        latitude, longitude = _somewhere()
+        dived_later = _own(db, diver, name="C site", latitude=latitude, longitude=longitude)
+        saved = create_commons_site(db, name="B site", latitude=latitude + 0.1, longitude=longitude - 0.1)
+        save_dive_site(db, saved, user=diver)
+        never_dived = _own(db, diver, name="A site", latitude=latitude - 0.1, longitude=longitude + 0.1)
+        _dive_at(db, diver, dived_later, datetime(2026, 5, 1, tzinfo=UTC))
+        _dive_at(db, diver, saved, datetime(2026, 3, 1, tzinfo=UTC))
+        outside = _own(db, diver, latitude=latitude + 2.0, longitude=longitude)
+        pinless = _own(db, diver)
+        create_commons_site(db, latitude=latitude, longitude=longitude)
+        view = _view(latitude, longitude)
+
+        first = await _search(http, my="true", items_per_page=2, **view)
+        second = await _search(http, my="true", items_per_page=2, page=2, **view)
+
+        assert [row["uuid"] for row in first["rows"] + second["rows"]] == [
+            str(dived_later.uuid),
+            str(saved.uuid),
+            str(never_dived.uuid),
+        ]
+        assert first["total_count"] == 3 and first["has_more"] is True and second["has_more"] is False
+        assert {str(outside.uuid), str(pinless.uuid)}.isdisjoint(row["uuid"] for row in first["rows"] + second["rows"])
+
+    @pytest.mark.asyncio
+    async def test_without_text_a_view_narrows_tag_commons_match_and_sort_too(
+        self, http: httpx.AsyncClient, db: Session, diver: User
+    ) -> None:
+        latitude, longitude = _somewhere()
+        record = create_commons_site(db, latitude=latitude + 5.0, longitude=longitude)
+        matching = _own(
+            db, diver, name="B site", external_ids=record.external_ids, latitude=latitude, longitude=longitude
+        )
+        _own(db, diver, external_ids=record.external_ids, latitude=latitude + 2.0, longitude=longitude)
+        tag = create_tag(db, diver)
+        tagged = _own(db, diver, name="A site", latitude=latitude, longitude=longitude)
+        tagged_outside = _own(db, diver, latitude=latitude + 2.0, longitude=longitude)
+        db.add_all(
+            [
+                DiveSiteTag(dive_site_id=tagged.id, tag_id=tag.id, position=0),
+                DiveSiteTag(dive_site_id=tagged_outside.id, tag_id=tag.id, position=0),
+            ]
+        )
+        db.commit()
+        view = _view(latitude, longitude)
+
+        by_tag = await _search(http, my="true", tag_uuid=str(tag.uuid), **view)
+        by_match = await _search(http, my="true", commons_match="true", **view)
+        by_name = await _search(http, my="true", sort="name", **view)
+
+        assert [row["uuid"] for row in by_tag["rows"]] == [str(tagged.uuid)] and by_tag["total_count"] == 1
+        assert [row["uuid"] for row in by_match["rows"]] == [str(matching.uuid)] and by_match["total_count"] == 1
+        assert [row["uuid"] for row in by_name["rows"]] == [str(tagged.uuid), str(matching.uuid)]
+
+    @pytest.mark.asyncio
+    async def test_without_text_a_view_crossing_the_antimeridian_holds_both_sides(
+        self, http: httpx.AsyncClient, db: Session, diver: User
+    ) -> None:
+        latitude = round(random.uniform(-60, 60), 4)
+        east_side = _own(db, diver, name="A east", latitude=latitude, longitude=179.95)
+        west_side = _own(db, diver, name="B west", latitude=latitude, longitude=-179.95)
+        _own(db, diver, latitude=latitude, longitude=0.0)
+
+        body = await _search(
+            http,
+            my="true",
+            sort="name",
+            south=latitude - 0.01,
+            north=latitude + 0.01,
+            west=179.9,
+            east=-179.9,
+        )
+
+        assert [row["uuid"] for row in body["rows"]] == [str(east_side.uuid), str(west_side.uuid)]
+        assert body["total_count"] == 2
 
     @pytest.mark.asyncio
     async def test_a_typed_word_matches_the_locality_too_after_the_names(
@@ -608,10 +687,10 @@ class TestYourSites:
         by_name = _own(db, diver, name=f"{town} Reef", latitude=latitude, longitude=longitude)
         view = _view(latitude, longitude)
 
-        yours = (await _search(http, q=town.lower(), yours="true", **view))["rows"]
+        mine = (await _search(http, q=town.lower(), my="true", **view))["rows"]
         everyone = (await _search(http, q=town.lower(), **view))["rows"]
 
-        assert [(row["uuid"], row["match"]) for row in yours] == [
+        assert [(row["uuid"], row["match"]) for row in mine] == [
             (str(by_name.uuid), "prefix"),
             (str(by_locality.uuid), None),
         ]
@@ -622,7 +701,7 @@ class TestYourSites:
         term = _marked()
         create_commons_site(db, name=term)
 
-        assert (await _search(http, q=term, yours="true"))["rows"] == []
+        assert (await _search(http, q=term, my="true"))["rows"] == []
 
     @pytest.mark.asyncio
     async def test_tag_commons_match_and_sort_narrow_and_order_as_the_list(
@@ -636,10 +715,10 @@ class TestYourSites:
         db.commit()
         foreign = create_tag(db, other_diver)
 
-        by_tag = await _search(http, yours="true", tag_uuid=str(tag.uuid))
-        by_foreign_tag = await _search(http, yours="true", tag_uuid=str(foreign.uuid))
-        by_match = await _search(http, yours="true", commons_match="true")
-        by_name = await _search(http, yours="true", sort="name")
+        by_tag = await _search(http, my="true", tag_uuid=str(tag.uuid))
+        by_foreign_tag = await _search(http, my="true", tag_uuid=str(foreign.uuid))
+        by_match = await _search(http, my="true", commons_match="true")
+        by_name = await _search(http, my="true", sort="name")
 
         assert [row["uuid"] for row in by_tag["rows"]] == [str(tagged.uuid)]
         assert by_foreign_tag["rows"] == [] and by_foreign_tag["total_count"] == 0
@@ -655,7 +734,7 @@ class TestYourSites:
         _own(db, diver, name=f"A {term[:5]}a{term[6:]}")
         geocoder(_answering(_place("Town", 1.0, 1.0)))
 
-        rows = (await _search(http, q=term, yours="true", sort="name"))["rows"]
+        rows = (await _search(http, q=term, my="true", sort="name"))["rows"]
 
         assert [(row["kind"], row.get("match")) for row in rows] == [
             ("site", "fuzzy"),
@@ -667,9 +746,7 @@ class TestYourSites:
         "narrowing", [{"tag_uuid": str(uuid_pkg.uuid4())}, {"commons_match": "false"}, {"sort": "name"}]
     )
     @pytest.mark.asyncio
-    async def test_each_narrowing_without_yours_is_a_422(
-        self, http: httpx.AsyncClient, narrowing: dict[str, str]
-    ) -> None:
+    async def test_each_narrowing_without_my_is_a_422(self, http: httpx.AsyncClient, narrowing: dict[str, str]) -> None:
         assert (await http.get("/dive-sites/search", params=narrowing)).status_code == 422
 
 
