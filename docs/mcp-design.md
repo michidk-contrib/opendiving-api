@@ -95,8 +95,11 @@ under an account lock. Files live in the existing blob store. The blob-key inven
 temporary-file table so account purge and orphan sweeping recognize them. Staging reclaims expired
 and revoked connections' files under the same account lock, so their quota is available immediately.
 
-Upload tools accept staged handles and retain existing preview/apply import behavior. Binary results
-become private download handles. The `opendiving://file/{handle}` resource describes a download
+Upload tools accept staged handles and retain existing preview/apply import behavior:
+`create_logbook_import` stages an import for `apply_logbook_import`, or with `query.apply=true`
+imports it at once, as `POST /imports` does. That needs no permission beyond the staged path
+(`import:write` and `files:write`), and its retry key carries the route's own description.
+Binary results become private download handles. The `opendiving://file/{handle}` resource describes a download
 without embedding large binary data in model context. Download requests use the connection's bearer
 token. Downloads preserve the attachment filename and media type. They spill to disk after 1 MiB,
 stop at the 50 MiB temporary-file limit, and copy into either blob backend without materializing the
