@@ -33,10 +33,10 @@ References checked on 2026-11-01:
 ## Delegated authorization
 
 Each browser approval creates a connection owned by one account and one OAuth client. The user
-selects requested permissions, with reads selected initially. Write and delete permissions are
-separate for each content domain. Profile and preference permissions are independent. Check-in links
-stay browser-only, like credential management. Import permission authorizes restoring content across
-logbook domains.
+selects requested permissions, with reads other than check-in selected initially. Write and delete
+permissions are separate for each content domain. Profile and preference permissions are
+independent. Check-in links stay browser-only, like credential management. Import permission
+authorizes restoring content across logbook domains.
 
 Codes expire after two minutes and are consumed under a database lock. They bind the user, client,
 resource, PKCE challenge and redirect. Pending consent expires after ten minutes and is single-use.
