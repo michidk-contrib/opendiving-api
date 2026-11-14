@@ -432,6 +432,10 @@ async def test_all_catalog_schemas_are_resolvable(
     by_name = {tool["name"]: tool for tool in tools}
     assert "files" in by_name["create_logbook_import"]["inputSchema"]["required"]
     assert "files" not in by_name["apply_logbook_import"]["inputSchema"]["properties"]
+    # Immediate apply is offered as on REST, and the retry key says it only applies there.
+    create_import = by_name["create_logbook_import"]["inputSchema"]["properties"]
+    assert create_import["query"]["properties"]["apply"]["type"] == "boolean"
+    assert "apply=true" in create_import["idempotency_key"]["description"]
     from jsonschema import Draft202012Validator
 
     for tool in tools:

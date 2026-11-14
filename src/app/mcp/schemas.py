@@ -61,7 +61,7 @@ def argument_schema(operation: Operation, document: dict[str, Any]) -> dict[str,
             header = next(branch for branch in header["anyOf"] if branch.get("type") == "string")
         properties["idempotency_key"] = {
             **{key: value for key, value in header.items() if key != "default"},
-            "description": "Reuse the same key when retrying a create request.",
+            "description": idempotency.get("description") or "Reuse the same key when retrying a create request.",
         }
     if operation.name == "read_dive_profile":
         properties["max_profile_points"] = {
