@@ -5,7 +5,12 @@ a deliberately withheld one look the same at runtime. The walk below makes the d
 decision someone wrote down.
 """
 
-from src.app.api.dependencies import get_current_superuser, get_current_user, refuse_api_keys
+from src.app.api.dependencies import (
+    get_current_superuser,
+    get_current_user,
+    get_downloading_user,
+    refuse_api_keys,
+)
 from src.app.authorization.operations import OPERATIONS
 from src.app.authorization.policy import permission_requirements
 from src.app.main import app
@@ -24,6 +29,10 @@ EXCLUDED: dict[tuple[str, str], str] = {
 }
 
 
+# `get_downloading_user` calls `get_current_user` directly rather than through `Depends`.
+_RESOLVES_CREDENTIALS = {get_current_user, get_downloading_user}
+
+
 def _withheld_by_rule(calls: list[object]) -> bool:
     return refuse_api_keys in calls or get_current_superuser in calls
 
@@ -33,7 +42,7 @@ def test_every_authenticated_route_is_classified() -> None:
     unclassified = sorted(
         str(route)
         for route in iter_api_routes(app)
-        if get_current_user in (calls := dependency_calls(route.dependant))
+        if _RESOLVES_CREDENTIALS & set(calls := dependency_calls(route.dependant))
         and not _withheld_by_rule(calls)
         and route.key not in listed
         and route.key not in EXCLUDED
