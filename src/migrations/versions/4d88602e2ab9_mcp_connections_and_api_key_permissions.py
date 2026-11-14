@@ -1,7 +1,7 @@
 """MCP connections, file handles and detailed API-key permissions
 
 Revision ID: 4d88602e2ab9
-Revises: 65940d01a99c
+Revises: c4a8e2d6f1b3
 Create Date: 2026-11-13 12:00:00.000000
 
 Delegated MCP authorization (clients, connections with their last use, codes, tokens, tool-call
@@ -18,7 +18,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = "4d88602e2ab9"
-down_revision: str | None = "65940d01a99c"
+down_revision: str | None = "c4a8e2d6f1b3"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
