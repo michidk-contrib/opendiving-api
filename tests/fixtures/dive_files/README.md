@@ -5,10 +5,11 @@ Real inputs to the readers, copied from the `divejson` package's own conformance
 `suunto-ocean-2026.json` and the two `ocean-poor-first-fix` files at the one released as 0.21.0, and
 the two `perdix3` files at the one released as 0.33.0, and the two `ocean-heart-rate` files at the
 one released as 0.35.0) under its MIT licence. Each keeps the package's file name; the package's
-`fixtures/README.md` says what each one exercises there. The one dive-computer original,
-`shearwater-perdix-3_D9772626_2026-10-26T1503.bin`, is copied the same way from
+`fixtures/README.md` says what each one exercises there. The two dive-computer originals,
+`shearwater-perdix-3_D9772626_2026-10-26T1503.bin` and
+`suunto-ocean_253810000400_2026-10-26T1501.bin`, are copied the same way from
 `divejson/divejson-c`'s `tests/fixtures/libdivecomputer/`, at the commit released as 0.1.0, also
-under MIT.
+under MIT; the iOS app's test fixtures hold the same bytes.
 
 | File                                               | Recorded whole or built by hand                                                                                               |
 | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
@@ -25,6 +26,7 @@ under MIT.
 | `perdix3-dives-1-and-8.db`                         | Reduced from a Shearwater Cloud Desktop database export: two of a Perdix 3's dives                                            |
 | `perdix3-dive-8.xml`                               | Reduced from Shearwater Cloud Desktop's XML export of the second of those dives                                               |
 | `shearwater-perdix-3_D9772626_2026-10-26T1503.bin` | Recorded whole: one dive's buffer as libdivecomputer downloaded it from a Perdix 3, descriptor `Shearwater` / `Perdix 3` / 14 |
+| `suunto-ocean_253810000400_2026-10-26T1501.bin`    | Recorded whole: that dive's buffer as libdivecomputer downloaded it from a Suunto Ocean, descriptor `Suunto` / `Ocean` / 1    |
 
 The two `suunto-ocean-2026` files are one dive exported twice by one computer, and so are the two
 `suunto-ocean` files: the pairs the door, label and fill tests run over. The second pair's JSON
