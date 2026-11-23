@@ -106,8 +106,8 @@ class TestTheWriteSchema:
             PersonCreate.model_validate({"name": "Alex", "email": "alex@"})
 
     def test_the_create_body_refuses_what_it_does_not_know(self) -> None:
-        """`connected_user_id` in particular: a body names an account by username, and only the
-        route turns that into a row id."""
+        """`connected_user_id` in particular: a body names an account by a connect link or a
+        public id, and only the route turns that into a row id."""
         with pytest.raises(ValidationError):
             PersonCreate.model_validate({"name": "Alex", "connected_user_id": 7})
 
@@ -116,7 +116,7 @@ class TestTheWriteSchema:
         with pytest.raises(ValidationError, match="cannot be null"):
             PersonUpdate.model_validate({field: None})
 
-    @pytest.mark.parametrize("field", ["email", "phone", "username"])
+    @pytest.mark.parametrize("field", ["email", "phone"])
     def test_a_patch_clears_the_nullable_members(self, field: str) -> None:
         values = PersonUpdateRequest.model_validate({field: None})
 
@@ -225,22 +225,6 @@ class TestTheRoutes:
             "invalidate_certification_caches",
         ):
             route_collaborators[name].assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_a_null_username_disconnects_and_drops_the_hide(self, route_collaborators: dict[str, Any]) -> None:
-        """What the phone's previous build queues to disconnect a person, held as it was."""
-        await people_module.patch_person(
-            request=MagicMock(),
-            uuid=uuid7(),
-            values=PersonUpdateRequest.model_validate({"username": None}),
-            current_user=_current_user(),
-            db=AsyncMock(),
-        )
-
-        assert route_collaborators["update"].await_args.kwargs["object"] == {
-            "connected_user_id": None,
-            "connection_hidden_at": None,
-        }
 
     @pytest.mark.asyncio
     async def test_a_delete_drops_every_family_whose_reads_it_changes(
@@ -512,7 +496,16 @@ class TestTheConnectMembers:
         with pytest.raises(ValidationError, match="not several"):
             PersonCreate.model_validate({"name": "A", "connect_link": "a" * 32, "connect_account": str(uuid7())})
         with pytest.raises(ValidationError, match="not several"):
-            PersonUpdateRequest.model_validate({"username": None, "connect_link": "a" * 32})
+            PersonUpdateRequest.model_validate({"connect_account": str(uuid7()), "connect_link": "a" * 32})
+
+    @pytest.mark.parametrize("schema", [PersonCreate, PersonUpdateRequest])
+    @pytest.mark.parametrize("username", [None, "alexm"])
+    def test_a_username_is_refused_like_any_member_the_body_does_not_declare(
+        self, schema: Any, username: str | None
+    ) -> None:
+        """Connecting by username is gone: a body naming one, even null, is a 422."""
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            schema.model_validate({"name": "A", "username": username})
 
 
 @pytest.mark.skipif(not db_available(), reason="No database connection available")
@@ -649,53 +642,6 @@ class TestConnecting:
 
         with pytest.raises(DuplicateValueException):
             await _create(async_db, diver, name=taken.upper(), connect_link=token)
-
-
-@pytest.mark.skipif(not db_available(), reason="No database connection available")
-class TestTheHeldUsername:
-    """What the previous web build and the phone's previous build send, until they are gone."""
-
-    @pytest.mark.asyncio
-    async def test_a_null_on_a_create_changes_nothing(self, async_db: AsyncSession, diver: User) -> None:
-        created = await _create(async_db, diver, username=None)
-
-        assert created.username is None
-
-    @pytest.mark.asyncio
-    async def test_any_username_on_a_create_is_refused_naming_the_connect_link(
-        self, async_db: AsyncSession, diver: User, other_diver: User
-    ) -> None:
-        with pytest.raises(RequestValidationError) as refused:
-            await _create(async_db, diver, username=other_diver.username)
-
-        assert _refusal(refused) == (("body", "username"), person_connections.USERNAME_RETIRED)
-        assert "connect link" in person_connections.USERNAME_RETIRED
-
-    @pytest.mark.asyncio
-    async def test_on_an_update_the_connected_username_keeps_the_tie_and_another_is_refused(
-        self, db: Session, async_db: AsyncSession, diver: User, other_diver: User
-    ) -> None:
-        person = create_person(db, diver, connected_to=other_diver)
-        person_id, person_uuid, same, other = person.id, person.uuid, other_diver.username, create_user(db).username
-
-        await _patch(async_db, diver, person_uuid, username=same, notes="Kept")
-        with pytest.raises(RequestValidationError) as refused:
-            await _patch(async_db, diver, person_uuid, username=other)
-
-        read = await people_module._read(async_db, person_id)
-        assert (read.username, read.notes) == (same, "Kept")
-        assert _refusal(refused)[0] == ("body", "username")
-
-    @pytest.mark.asyncio
-    async def test_a_null_on_an_update_disconnects(
-        self, db: Session, async_db: AsyncSession, diver: User, other_diver: User
-    ) -> None:
-        person = create_person(db, diver, connected_to=other_diver)
-        person_id, person_uuid = person.id, person.uuid
-
-        await _patch(async_db, diver, person_uuid, username=None)
-
-        assert (await people_module._read(async_db, person_id)).username is None
 
 
 @pytest.mark.skipif(not db_available(), reason="No database connection available")
