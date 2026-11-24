@@ -6,6 +6,7 @@ from typing import Annotated, ClassVar
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, model_validator
 
 from ..core.schemas import MAX_LIST_ITEMS, NOTES_MAX_LENGTH, PublicUUIDSchema, RejectsExplicitNulls, StoredVocabulary
+from .custom_property import CustomPropertiesRead, CustomPropertiesUpdate, CustomPropertiesWrite
 
 # DiveJSON §6.20's bounds, and the widths of the columns behind them.
 PERSON_NAME_MAX = 255
@@ -106,7 +107,7 @@ PeopleRead = Annotated[
 ]
 
 
-class PersonBase(BaseModel):
+class PersonBase(CustomPropertiesWrite):
     name: PersonName
     email: PersonEmail
     phone: PersonPhone
@@ -115,7 +116,7 @@ class PersonBase(BaseModel):
     ]
 
 
-class PersonRead(PublicUUIDSchema):
+class PersonRead(CustomPropertiesRead, PublicUUIDSchema):
     """A person as `GET /people` and `GET /person/{uuid}` serve it.
 
     `username` and `avatar_sha256` are the connected account's **current** ones - joined on
@@ -144,7 +145,7 @@ class PersonRead(PublicUUIDSchema):
     updated_at: datetime | None = None
 
 
-class PersonReadInternal(PublicUUIDSchema):
+class PersonReadInternal(CustomPropertiesRead, PublicUUIDSchema):
     """Mirrors the `person` table's columns, for server-side lookups only."""
 
     id: int
@@ -184,13 +185,13 @@ class PersonCreateInternal(PersonBase):
     connected_user_id: int | None = None
 
 
-class PersonUpdate(RejectsExplicitNulls):
+class PersonUpdate(CustomPropertiesUpdate, RejectsExplicitNulls):
     """The column shape of a person's PATCH, which `test_update_explicit_nulls.py` sweeps
     against the table. The tie is `PersonUpdateRequest`'s."""
 
     model_config = ConfigDict(extra="forbid")
 
-    NON_NULLABLE_FIELDS: ClassVar[tuple[str, ...]] = ("name", "notes")
+    NON_NULLABLE_FIELDS: ClassVar[tuple[str, ...]] = ("name", "notes", "custom_properties")
 
     name: Annotated[
         str | None,

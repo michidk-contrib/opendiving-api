@@ -61,6 +61,7 @@ def _select_people() -> Any:
             Person.email,
             Person.phone,
             Person.notes,
+            Person.custom_properties,
             User.username,
             UserPicture.rendition_sha256.label("avatar_sha256"),
             _dive_count().label("dive_count"),

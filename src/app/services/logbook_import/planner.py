@@ -42,7 +42,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from divejson import IN_WATER_DEPTH, InWater
 from pydantic import EmailStr, TypeAdapter, ValidationError
@@ -74,6 +74,7 @@ from ...models.trip import Trip
 from ...models.user import User
 from ...schemas.certification import CertificationAgency, CertificationSide
 from ...schemas.contact import ADDRESS_FIELDS, CONTACT_ADDRESS_PREFIX, canonical_roles, check_website
+from ...schemas.custom_property import CUSTOM_PROPERTIES_MAX, CustomProperty
 from ...schemas.dive_conditions import DiveConditionsRead
 from ...schemas.dive_profile import MILLISECONDS_PER_SECOND
 from ...schemas.dive_site import (
@@ -84,7 +85,7 @@ from ...schemas.dive_site import (
     canonical_other_names,
     identifier_problem,
 )
-from ...schemas.export import DIVEJSON_PRODUCER_KEY
+from ...schemas.export import CUSTOM_PROPERTIES_EXTENSION, DIVEJSON_PRODUCER_KEY
 from ...schemas.gear_item import CylinderMaterial, GearType
 from ...schemas.location import DIVE_SITE_LOCATION_PREFIX, LOCATION_FIELDS
 from ...schemas.logbook_import import (
@@ -96,7 +97,6 @@ from ...schemas.logbook_import import (
     ImportCourse,
     ImportCylinder,
     ImportDive,
-    ImportDiver,
     ImportDiveSite,
     ImportFileReport,
     ImportGearItem,
@@ -983,6 +983,39 @@ class _Planner:
     def _dropped(self, collection: str, record_uuid: uuid_pkg.UUID, reason: str) -> None:
         self._note(ImportNoteCode.VALUE_DROPPED, reason, collection=collection, uuid=record_uuid)
 
+    def _custom_properties(self, collection: str, record: _Extended) -> list[dict[str, str]]:
+        """The custom properties this app's writer put on a record, held to what a write takes.
+
+        A property a write would refuse - an empty key or value, one too long, a key already
+        given, one past the most a record holds - is dropped and reported, the rest kept in
+        order. Anything else under the key is another writer's and reads as none (spec §5.5).
+        """
+        entry = _producer_entry(record, CUSTOM_PROPERTIES_EXTENSION)
+        if not isinstance(entry, list):
+            return []
+        kept: list[dict[str, str]] = []
+        seen: set[str] = set()
+        dropped = 0
+        for item in entry:
+            try:
+                prop = CustomProperty.model_validate(item)
+            except ValidationError:
+                dropped += 1
+                continue
+            if prop.key.casefold() in seen or len(kept) == CUSTOM_PROPERTIES_MAX:
+                dropped += 1
+                continue
+            seen.add(prop.key.casefold())
+            kept.append(prop.model_dump())
+        if dropped:
+            self._dropped(
+                collection,
+                record.uuid,
+                f"{dropped} of its custom properties could not be kept: each needs a key and a value, "
+                f"a key once, and at most {CUSTOM_PROPERTIES_MAX} of them",
+            )
+        return kept
+
     # ------------------------------------------------------------------ lookups
 
     async def _rows_by_uuid(self, model: Any, uuids: Sequence[uuid_pkg.UUID]) -> dict[uuid_pkg.UUID, _ExistingRow]:
@@ -1561,6 +1594,7 @@ class _Planner:
 
         latitude, longitude = self._position(collection, contact.uuid, contact.position, "contact's")
         record.values = {
+            "custom_properties": self._custom_properties("contacts", contact),
             "user_id": self._user_id,
             "name": name,
             # Already stripped of values outside the vocabulary by the reader (§5.6); a set,
@@ -1722,6 +1756,7 @@ class _Planner:
             return record
 
         record.values = {
+            "custom_properties": self._custom_properties("people", person),
             "user_id": self._user_id,
             "name": name,
             "email": self._email(collection, person.uuid, person.email),
@@ -1901,6 +1936,7 @@ class _Planner:
             "name": name,
             "notes": self._notes_text("trips", trip.uuid, trip.notes),
             "created_at": self._created_at(trip.created_at),
+            "custom_properties": self._custom_properties("trips", trip),
         }
         record.children = {
             "parts": self._plan_trip_parts(trip),
@@ -1975,6 +2011,7 @@ class _Planner:
             self._dropped("courses", course.uuid, "The end date preceded the start date, and was dropped")
             end_date = None
         record.values = {
+            "custom_properties": self._custom_properties("courses", course),
             "user_id": self._user_id,
             "name": name,
             "agency": agency,
@@ -2095,6 +2132,7 @@ class _Planner:
         )
         record.children = {
             "notes": self._notes_text("sites", site.uuid, site.notes),
+            "custom_properties": self._custom_properties("sites", site),
             "tags": self._tag_names(site.tags, collection="sites", record_uuid=site.uuid),
         }
         return record
@@ -2175,6 +2213,7 @@ class _Planner:
         }
         record.children = {
             "notes": self._notes_text("sites", site.uuid, site.notes),
+            "custom_properties": self._custom_properties("sites", site),
             "tags": self._tag_names(site.tags, collection="sites", record_uuid=site.uuid),
         }
         return record
@@ -2274,6 +2313,7 @@ class _Planner:
             material = None
         vessel = self._bounded("gear", item.uuid, item, _GEAR_BOUNDS)
         record.values = {
+            "custom_properties": self._custom_properties("gear", item),
             "user_id": self._user_id,
             "name": name,
             "brand": brand,
@@ -2326,6 +2366,7 @@ class _Planner:
             self._dropped("gear_sets", gear_set.uuid, "A negative ballast weight was dropped")
             weight = None
         record.values = {
+            "custom_properties": self._custom_properties("gear_sets", gear_set),
             "user_id": self._user_id,
             "name": name,
             "weight": weight,
@@ -2546,6 +2587,7 @@ class _Planner:
             return record
 
         record.values = {
+            "custom_properties": self._custom_properties("certifications", certification),
             "user_id": self._user_id,
             "agency": agency[0],
             "agency_other": agency[1],
@@ -3005,6 +3047,7 @@ class _Planner:
         start_time, offset_minutes, date_only = split_dive_start_time(dive.started_at)
         number = bounded.get("number")
         record.values = {
+            "custom_properties": self._custom_properties("dives", dive),
             "user_id": self._user_id,
             # A dive number is the diver's own numbering and `NOT NULL` here. Absent - or
             # dropped by the bound above - the dive takes the number the dive form would
@@ -3615,7 +3658,14 @@ def _carried_conditions(dive: ImportDive) -> DiveConditionsRead | None:
         return None
 
 
-def _producer_entry(record: ImportStoredFile | ImportPerson | ImportDiver | ImportDive, member: str) -> Any:
+class _Extended(Protocol):
+    """A document record that may carry `extensions`."""
+
+    uuid: Any
+    extensions: dict[str, Any] | None
+
+
+def _producer_entry(record: _Extended, member: str) -> Any:
     """One value out of this producer's extension entry (spec §5.5).
 
     Defensive about the shape all the way down: `extensions` is typed as "any JSON value
