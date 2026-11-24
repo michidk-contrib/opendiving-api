@@ -158,7 +158,7 @@ from ...services.dive_recordings import (
 )
 from ...services.dive_stats import recalculate_dive_stats
 from ...services.gear_stats import recalculate_gear_dive_counts
-from ...services.person_links import resolve_people_references
+from ...services.person_connections import resolve_people_references
 from ...services.recording_shape import gate_figures
 from ..idempotency import IdempotentCreate
 
@@ -1202,10 +1202,12 @@ async def read_dive_neighbors(
 ) -> DiveNeighbors:
     """Return the dives immediately before and after this one in the caller's own log.
 
-    Just enough of each to link to it - uuid, number and start time - so a dive page can
-    offer prev/next without fetching either dive. `previous` is the one logged earlier and
-    `next` the one logged later, which is the reverse of `GET /dives`, where the list runs
-    newest first. Either is null at the ends of the log.
+    Enough of each to link to it and tell the two apart - uuid, number, start time, max depth
+    and submerged time - so a dive page can offer prev/next, or a choice between the two,
+    without fetching either dive. `max_depth` is null where the dive has none recorded.
+    `previous` is the one logged earlier and `next` the one logged later, which is the
+    reverse of `GET /dives`, where the list runs newest first. Either is null at the ends
+    of the log.
 
     Always the whole log: the `trip_uuid`/`course_uuid`/`dive_site_uuid`/`gear_item_uuid` filters on
     `GET /dives` have no counterpart here, so walking prev/next from a dive opened out of a
@@ -1433,8 +1435,9 @@ async def merge_two_dives(
     both dives record a UTC offset, by wall clock where either does not. The other dive's
     recordings, files, sites, gear, species, people, tags and notes move onto it, and its
     cylinders fill the blanks of the ones the two dives share and join the list where this
-    one lacks them; the dive itself is deleted, its uuid stops resolving and nothing here
-    can be undone.
+    one lacks them; the dive itself is deleted, no read finds it again and nothing here can be
+    undone. Its uuid is the surviving dive's to an import and to `POST /dive-computers/known-dives`:
+    a file or a document of the merged-away dive adds no dive.
 
     **What happens to the recordings depends on whether one computer or two recorded the
     dive.** The same computer's two records fold into a single recording: the later record's

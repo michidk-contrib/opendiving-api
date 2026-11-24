@@ -11,6 +11,7 @@ from sqlalchemy import CursorResult, Delete, and_, delete, func, or_, select, up
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...crud.crud_auth_audit_events import expired_event_predicate
+from ...crud.crud_daily_external_requests import add_external_requests
 from ...crud.crud_daily_totals import record_monthly_active_accounts, record_sign_ins, snapshot_active_accounts
 from ...crud.crud_user_sessions import swept_session_predicate
 from ...models.auth_audit_event import AuthAuditEvent
@@ -24,6 +25,7 @@ from ...models.gear_service_schedule import GearServiceSchedule
 from ...models.idempotency_hold import IdempotencyHold
 from ...models.invitation import Invitation
 from ...models.invite_request import InviteRequest
+from ...models.person import Person
 from ...models.user import User
 from ...models.user_session import UserSession
 from ...schemas.gear_service import ServiceStatus
@@ -60,6 +62,7 @@ from ..config import configure_logging, settings
 from ..db.database import local_session
 from ..db.token_blacklist import TokenBlacklist
 from ..setup import close_redis_cache_pool, create_redis_cache_pool
+from ..utils import external_requests
 
 asyncio.set_event_loop(uvloop.new_event_loop())
 
@@ -358,6 +361,24 @@ async def record_sign_in_totals(ctx: dict[Any, Any]) -> str:
     return "Recorded daily sign-in totals"
 
 
+async def move_external_request_counts(ctx: dict[Any, Any]) -> str:
+    """Move the buffered external request counts from Redis into `daily_external_request`.
+
+    What is taken leaves Redis before the commit, so a run that dies in between loses those
+    counts and none is ever written twice.
+    """
+    rows = await external_requests.take_buffered()
+    if not rows:
+        return "No external request counts to move"
+
+    async with local_session() as db:
+        await add_external_requests(db, rows)
+        await db.commit()
+
+    logger.info("Moved %d external request count(s)", len(rows))
+    return f"Moved {len(rows)} external request count(s)"
+
+
 async def purge_unserved_map_tiles(ctx: dict[Any, Any]) -> str:
     """Delete the map tiles no request has found for `UNSERVED_RETENTION`, and their files, a
     batch per transaction until none is left.
@@ -491,6 +512,9 @@ async def _purge_one_account(db: AsyncSession, *, user_id: int, email: str, cuto
     purged_email = email.lower()
     await db.execute(delete(Invitation).where(Invitation.email == purged_email))
     await db.execute(delete(InviteRequest).where(InviteRequest.email == purged_email))
+    # Other divers' people connected to this account are disconnected by the `SET NULL` below,
+    # which clears the key alone; a Hide this account left on one of those ties goes with it.
+    await db.execute(update(Person).where(Person.connected_user_id == user_id).values(connection_hidden_at=None))
     result = cast(
         CursorResult,
         await db.execute(

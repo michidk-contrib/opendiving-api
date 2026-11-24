@@ -11,21 +11,45 @@ decides, before the diver has ever set it.
 *Show by default***, where that computer stands before the one whose recording the dive shows
 (`show_first_by_default`). Nothing reads the order afterwards, so changing it rewrites no
 dive, and a diver's own choice on a dive stands until a later write adds another recording.
+
+**Which of a computer's listed dives the logbook holds**, and whether the holding recording
+keeps that computer's original download of it, is answered here and not by a client, by the
+same clock rule and tolerance the import's same-recording gate uses (`known_dives`): a dive
+held by mistake is one the diver is never offered, and an original claimed by mistake is one
+never sent, so the rule has one home and errs toward an original missing.
 """
 
+import uuid as uuid_pkg
+from bisect import bisect_left, bisect_right
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import distinct_on
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..core.utils.datetime_offset import split_local_start_time
 from ..models.dive import Dive
+from ..models.dive_file import DiveFile
+from ..models.dive_profile import DiveProfile
 from ..models.dive_recording import DiveRecording
 from ..models.user import User
-from ..schemas.dive_computer import DiveComputerRead
-from .dive_recordings import folded_serial, make_primary
+from ..schemas.dive_computer import DiveComputerRead, KnownDive, ListedDive
+from .dive_profiles import MERGE_PARSER_KEY
+from .dive_recordings import (
+    CANDIDATE_WINDOW,
+    SAME_RECORDING_START_TOLERANCE,
+    DeviceIdentity,
+    RecordingFacts,
+    folded_serial,
+    holds_listed_start,
+    make_primary,
+    signed_delta_seconds,
+)
+from .libdivecomputer import LIBDIVECOMPUTER
+from .merged_dives import resolve_merges
 
 
 class RepeatedSerialError(ValueError):
@@ -168,3 +192,171 @@ async def show_first_by_default(db: AsyncSession, *, user_id: int, dive_id: int,
         return None
     await make_primary(db, recording_id=recording_id, dive_id=dive_id)
     return int(added.ordinal)
+
+
+@dataclass(frozen=True, slots=True)
+class _Stored:
+    """A recording of the listed computer, on a live dive of the caller's, with its stored
+    start column, which the bisect orders by, and the fallback start of each computer
+    original it holds - `None` for one that carries none, and no entry where it holds none."""
+
+    start: datetime | None
+    facts: RecordingFacts
+    dive_uuid: uuid_pkg.UUID
+    originals: tuple[datetime | None, ...]
+
+
+async def _recordings_of(db: AsyncSession, *, user_id: int, serial: str) -> list[_Stored]:
+    """The caller's recordings that name this serial, folded, on live dives, ordered by the
+    stored start column with those that have none last.
+
+    The serial's spellings come first, folded here for `_recorded`'s reason, so the second
+    query matches them exactly. Two queries whatever the number of dives listed.
+    """
+    folded = folded_serial(serial)
+    if folded is None:
+        return []
+    spellings = [
+        spelled
+        for spelled in (
+            await db.execute(
+                select(DiveRecording.device_serial)
+                .where(DiveRecording.user_id == user_id, DiveRecording.device_serial.is_not(None))
+                .distinct()
+            )
+        ).scalars()
+        if folded_serial(spelled) == folded
+    ]
+    if not spellings:
+        return []
+    originals = (
+        select(func.array_agg(DiveFile.fallback_start))
+        .where(
+            DiveFile.recording_id == DiveRecording.id,
+            DiveFile.user_id == user_id,
+            DiveFile.parser_key == LIBDIVECOMPUTER,
+        )
+        .scalar_subquery()
+    )
+    rows = await db.execute(
+        select(
+            DiveRecording.start_time,
+            DiveRecording.utc_offset_minutes,
+            DiveProfile.duration.label("sampled_span"),
+            DiveProfile.parser_key,
+            Dive.uuid.label("dive_uuid"),
+            originals.label("originals"),
+        )
+        .join(Dive, Dive.id == DiveRecording.dive_id)
+        .outerjoin(DiveProfile, DiveProfile.recording_id == DiveRecording.id)
+        .where(
+            DiveRecording.user_id == user_id,
+            DiveRecording.device_serial.in_(spellings),
+            Dive.is_deleted.is_(False),
+        )
+        .order_by(DiveRecording.start_time.nulls_last(), DiveRecording.id)
+    )
+    return [
+        _Stored(
+            start=row.start_time,
+            facts=RecordingFacts(
+                device=DeviceIdentity(serial=serial),
+                start_time=row.start_time,
+                utc_offset_minutes=row.utc_offset_minutes,
+                sampled_span=row.sampled_span,
+                merged=row.parser_key == MERGE_PARSER_KEY,
+            ),
+            dive_uuid=row.dive_uuid,
+            originals=tuple(row.originals or ()),
+        )
+        for row in rows
+    ]
+
+
+async def known_dives(db: AsyncSession, *, user_id: int, serial: str, dives: Sequence[ListedDive]) -> list[KnownDive]:
+    """The listed dives the caller's logbook holds, in the order listed and each uuid once,
+    and whether each holder keeps the computer's original of it.
+
+    A dive is held by a live dive its uuid resolves to - the dive of that uuid, or the one it
+    was merged into, as an import resolves it - or by a recording of the serial whose start
+    `holds_listed_start` accepts, the predicate an import asks of a merge's recording. Three
+    queries for one listed dive or for 2,000: each listed start is compared only with the
+    recordings whose stored start lies within the gates' candidate window of it, widened by the
+    longest merge's span, found by bisecting the recordings' starts.
+
+    The original is told by `_keeps_original` from the recordings' rows alone, read in the same
+    query, so no stored file is read. A dive held by its uuid is told by its recordings of the
+    serial too, rather than answered yes: an import under that uuid links and writes no file,
+    so a no there costs one download that adds nothing.
+    """
+    if not dives:
+        return []
+    by_uuid = {
+        uuid: target.uuid
+        for uuid, target in (await resolve_merges(db, user_id=user_id, uuids={dive.uuid for dive in dives})).items()
+        if not target.is_deleted
+    }
+    recorded = await _recordings_of(db, user_id=user_id, serial=serial)
+    by_dive: dict[uuid_pkg.UUID, list[_Stored]] = {}
+    for one in recorded:
+        by_dive.setdefault(one.dive_uuid, []).append(one)
+    stored = [one for one in recorded if one.start is not None]
+    starts = [one.start for one in stored if one.start is not None]
+    longest_merge = timedelta(
+        milliseconds=max(
+            (one.facts.sampled_span or 0 for one in stored if one.facts.merged),
+            default=0,
+        )
+    )
+
+    known: list[KnownDive] = []
+    seen: set[uuid_pkg.UUID] = set()
+    for dive in dives:
+        if dive.uuid in seen:
+            continue
+        start, offset = split_local_start_time(dive.started_at)
+        holder = by_uuid.get(dive.uuid)
+        if holder is not None:
+            has_original = any(_keeps_original(one, start, offset) for one in by_dive.get(holder, ()))
+        else:
+            holding = _holding(start, offset, stored, starts, longest_merge)
+            if holding is None:
+                continue
+            holder, has_original = holding.dive_uuid, _keeps_original(holding, start, offset)
+        seen.add(dive.uuid)
+        known.append(KnownDive(uuid=dive.uuid, dive_uuid=holder, has_original=has_original))
+    return known
+
+
+def _holding(
+    start: datetime, offset: int | None, stored: list[_Stored], starts: list[datetime], longest_merge: timedelta
+) -> _Stored | None:
+    """The first recording, by stored start, that holds this listed start."""
+    low = bisect_left(starts, start - CANDIDATE_WINDOW - longest_merge)
+    high = bisect_right(starts, start + CANDIDATE_WINDOW)
+    for one in stored[low:high]:
+        if holds_listed_start(one.facts, start, offset):
+            return one
+    return None
+
+
+def _keeps_original(one: _Stored, start: datetime, offset: int | None) -> bool:
+    """Whether this recording keeps the computer's original of the dive listed at this start.
+
+    A recording that is one record holds only that record's original. A merge's holds two
+    records' files, and only an original's fallback start says which record it is: it must
+    lie within the same-recording tolerance of the listed start, compared as instants, so a
+    listed wall clock, which no instant can be put beside without inventing an offset, and a
+    file with no fallback start answer no. A wrong yes leaves an original off its dive for
+    good, and a wrong no costs one download whose upload changes nothing.
+    """
+    if not one.originals:
+        return False
+    if not one.facts.merged:
+        return True
+    if offset is None:
+        return False
+    return any(
+        fallback is not None and abs(signed_delta_seconds(start, offset, fallback, 0)) <= SAME_RECORDING_START_TOLERANCE
+        for fallback in one.originals
+    )

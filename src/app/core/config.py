@@ -277,7 +277,7 @@ class RegistrationMode(Enum):
 
     `open` is what this app did before the setting existed: any address that proves it owns
     itself gets an account. `invite` admits only an address someone already invited, or
-    whoever follows a member's invite link - plus the very first account on an empty
+    whoever follows a member's connect link - plus the very first account on an empty
     instance, which is the operator's own and is admitted in *both* modes (see
     `services.registration_gate`).
 
@@ -308,7 +308,7 @@ class AccountSource(StrEnum):
 # What a join-channel slug may be. The request bodies and the setting's own validator both
 # accept exactly this, so a value that cannot be configured cannot be sent; the resolve
 # route takes any segment and answers one outside it with the same 404 as an unknown slug.
-# A member's invite-link token rides the same `via` field, and is generated to fit it.
+# A member's connect-link token rides the same `via` field, and is generated to fit it.
 JOIN_CHANNEL_SLUG_PATTERN = r"^[a-z0-9-]{1,32}$"
 JOIN_CHANNEL_LABEL_MAX_LENGTH = 40
 
@@ -424,29 +424,14 @@ class RegistrationSettings(BaseSettings):
     def join_channels(self) -> dict[str, str]:
         return parse_join_channels(self.JOIN_CHANNELS)
 
-    # A *rate*, not a lifetime allotment: a member who invites five friends today can
-    # invite five more tomorrow. Counted from the `invitation` table rather than from the
+    # A *rate*, not a lifetime allotment: a member whose connect link lets five friends in
+    # today can let five more in tomorrow. Counted from the `invitation` table rather than from the
     # Redis limiter, because the limiter fails open on a Redis outage by design (see
     # `DECISIONS.md` §"Rate limiting fails open on a Redis *outage*") and its counters are
     # flushed locally - neither of which a growth bound on who gets into a closed beta
     # should inherit. Superusers are exempt.
     INVITATIONS_PER_USER: int = config("INVITATIONS_PER_USER", default=5)
     INVITATIONS_WINDOW_DAYS: int = config("INVITATIONS_WINDOW_DAYS", default=1)
-
-    # **A throttle, and not the quota above** - they bound different things and only one of
-    # them bounds the oracle. `POST /user/invitations` answers a distinguishable 409 for an
-    # address that already has an account, and that refusal creates no invitation row, so
-    # the quota (counted from rows created) never charges for it: unthrottled, a signed-in
-    # caller can walk a wordlist through the endpoint and learn who is registered, without
-    # limit. This is the shape `PATCH /user`'s username check already guards - "unthrottled
-    # it is a wordlist oracle over who exists" - and it is keyed per-user for the same
-    # reason: the caller is authenticated, so there is a better key than their IP.
-    #
-    # Deliberately above `INVITATIONS_PER_USER` rather than equal to it. It is a backstop
-    # against automated probing, not a second opinion on how many friends somebody may
-    # invite, and a diver who mistypes an address twice must not be spending the same
-    # budget that decides whether their fifth invitation goes out.
-    INVITATION_ATTEMPT_RATE_LIMIT_PER_USER: int = config("INVITATION_ATTEMPT_RATE_LIMIT_PER_USER", default=20)
 
     # Fixed-window rate limits on `POST /invite-requests`, keyed separately by the
     # submitted email and by client IP - the `ContactSettings` shape, with the support
@@ -515,10 +500,10 @@ class MagicLinkSettings(BaseSettings):
     # the rest of the profile (name, avatar, email-preference toggle) reveals nothing and
     # shouldn't 429 a settings page.
     USERNAME_CHANGE_RATE_LIMIT_PER_USER: int = config("USERNAME_CHANGE_RATE_LIMIT_PER_USER", default=5)
-    # Linking a person to an account by username (`POST`/`PATCH /person`) answers whether
-    # that username exists, the oracle above; an import's links count here too. Per user,
-    # over the same window, and spent only by a link that names a different account.
-    PERSON_LINK_RATE_LIMIT_PER_USER: int = config("PERSON_LINK_RATE_LIMIT_PER_USER", default=10)
+    # The people a logbook import connects to the accounts its file names - by public id,
+    # from a file rather than from those accounts' links. Per user, over the same window. A
+    # person write is not counted: its link or tie answers no guess.
+    PERSON_CONNECT_RATE_LIMIT_PER_USER: int = config("PERSON_CONNECT_RATE_LIMIT_PER_USER", default=10)
 
 
 class SMTPTLSMode(Enum):
@@ -771,7 +756,7 @@ class SpeciesSettings(BaseSettings):
     SPECIES_WORMS_RATE_LIMIT_REQUESTS: int = config("SPECIES_WORMS_RATE_LIMIT_REQUESTS", default=120)
     SPECIES_WIKIDATA_RATE_LIMIT_WINDOW_SECONDS: int = config("SPECIES_WIKIDATA_RATE_LIMIT_WINDOW_SECONDS", default=60)
     SPECIES_WIKIDATA_RATE_LIMIT_REQUESTS: int = config("SPECIES_WIKIDATA_RATE_LIMIT_REQUESTS", default=300)
-    # Commons gets a pair of its own because `_claim_provider_slot` indexes its `limits` dict
+    # Commons gets a pair of its own because the slot claim indexes `external_requests._LIMITS`
     # unguarded - a provider with no entry there is a `KeyError`, not a missing throttle.
     # Lower than Wikidata's: this one is charged at most twice per *new* species (the credit
     # call and the byte fetch) rather than once per enriched search candidate, so a number
@@ -820,8 +805,8 @@ class DiveConditionsSettings(BaseSettings):
     )
     # What one account may spend on `GET /dive-conditions/current`, the map's weather now, cache
     # hits included. The map asks on every settled pan into a new tenth-of-a-degree cell; a
-    # miss spends two of the instance's calls above, the forecast's and the sea's, as a lookup
-    # does, so the same figure leaves the worker the same room.
+    # miss spends three of the instance's calls above - the forecast's, the temperature models'
+    # and the sea's - where a lookup spends two.
     DIVE_CONDITIONS_CURRENT_RATE_LIMIT_PER_USER: int = config(
         "DIVE_CONDITIONS_CURRENT_RATE_LIMIT_PER_USER", default=120
     )
@@ -904,9 +889,13 @@ class LogbookImportSettings(BaseSettings):
     # outbound WoRMS calls - and a diver restoring a backup should not find their next
     # export refused because of it. An import is one upload, and ten an hour is the same
     # generosity the export limit means by ten downloads. Its apply counts apart, on the same
-    # figures.
+    # figures. An upload applied at once spends neither, only the third budget, over the same
+    # window: a phone sends one while a download runs, at most one every 30 seconds, so 240 is
+    # twice that with room for retries and a second device, and a download never spends the
+    # web's imports.
     IMPORT_RATE_LIMIT_WINDOW_SECONDS: int = config("IMPORT_RATE_LIMIT_WINDOW_SECONDS", default=3600)
     IMPORT_RATE_LIMIT_PER_USER: int = config("IMPORT_RATE_LIMIT_PER_USER", default=10)
+    IMPORT_AT_ONCE_RATE_LIMIT_PER_USER: int = config("IMPORT_AT_ONCE_RATE_LIMIT_PER_USER", default=240)
 
     # How long an uploaded import waits to be applied or discarded before it and its files are
     # deleted. Blank keeps it until the diver finishes it; below 1 refuses startup

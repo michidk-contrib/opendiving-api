@@ -658,7 +658,7 @@ class ImportPerson(_ReadModel):
 
     `email` is read as the string it is, as a contact's is, and the planner drops one this
     app could not have written. `extensions` is read because this app's own writer puts a
-    linked person's account there, which the planner may link again.
+    connected person's account there, which the planner may connect again.
     """
 
     uuid: uuid_pkg.UUID
@@ -727,7 +727,8 @@ class ImportNoteCode(StrEnum):
     # apply created none, and the row is the dive that holds it.
     REVIEW_OVERTAKEN = "review_overtaken"
     # The apply reached a dive the review has no row for, the logbook having moved: the file of
-    # a dive that lost its recording in between makes a dive of its own, which is written.
+    # a dive that lost its recording in between makes a dive of its own, which is written; and
+    # a dive deleted or merged away in between is what the apply's pass made of its files.
     REVIEW_UNSHOWN = "review_unshown"
     # The two remap codes say the same thing about *this* record - it was imported under an
     # identifier other than the one the document gave it, and neither is an error. They
@@ -782,9 +783,10 @@ class ImportNoteCode(StrEnum):
     # The diver took the archive's portrait, and the account's changed after the review they
     # chose from, so the account's was kept.
     PORTRAIT_KEPT = "portrait_kept"
-    # A person was linked (apply), or would be (upload), to the account on this instance its
-    # entry names - the sentence names that account's current username.
-    ACCOUNT_LINKED = "account_linked"
+    # A person was connected (apply), or would be (upload), to the account on this instance
+    # its entry names - the sentence names that account's current username. A review stored
+    # before the rename carries `account_linked`, read back as the string it is.
+    ACCOUNT_CONNECTED = "account_connected"
     # The tags the import adds to the caller's list, named in one note. Tags are members of a
     # dive rather than a collection, so no collection report counts them.
     TAGS_CREATED = "tags_created"
@@ -832,7 +834,7 @@ class ImportCollectionReport(BaseModel):
     training centers and the instructors an export written before either existed names on its
     courses and certifications, which it carries as strings rather than records. Each file's
     records are counted as an import of that file alone would count them, after the files
-    before it. A record the caller deleted here is skipped, never brought back.
+    before it. A record the caller deleted is counted as one the import creates.
     """
 
     collection: Annotated[str, Field(examples=["dives"])]
@@ -1115,7 +1117,7 @@ class ImportPortraitChoice(BaseModel):
 # served as it was stored and never validated again, so a change to any model below - or to
 # what they embed - owes this a bump and a call on the rows already stored: migrate them to the
 # new shape, or retire them. `tests/test_logbook_import_held.py` fails until the number moves.
-REVIEW_SHAPE = 2
+REVIEW_SHAPE = 3
 
 
 class LogbookImportStatus(StrEnum):

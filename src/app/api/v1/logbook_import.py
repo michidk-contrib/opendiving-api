@@ -12,8 +12,8 @@ the service layer, because each is an HTTP concern:
 - **Any number of files, in any mix of the formats this build reads.** A DiveJSON document,
   the full-export archive, a UDDF file, a Subsurface `.ssrf`, a FIT, a Suunto app export, a
   Suunto DM5 XML export, a Shearwater Cloud database or XML export, or a zip of any of those,
-  each sent as a `file` part - a watch writes one file per dive, and one file per import would
-  cap a diver at ten dives an hour against the rate limit below. Which formats exactly is
+  each sent as a `file` part - a watch writes one file per dive, and one file per reviewed
+  import would cap a diver at ten dives an hour against the rate limit below. Which formats exactly is
   `divejson.read_formats()` and never a list written out here.
 - **Uploaded once, reviewed anywhere, applied as reviewed.** `POST /imports` reads, converts and
   plans, and holds the readable files and the review until the import is applied or discarded,
@@ -25,8 +25,8 @@ the service layer, because each is an HTTP concern:
   export endpoints' docstring records why a whole-logbook endpoint is throttled at all, and
   this one is dearer than any export. The upload reads its own body, after the session, the
   limit and the account's slot have been checked, so a request refused for any of them reads
-  none of it. The apply has a budget of the same size beside it, an upload applied at once spends
-  one of each, and the reads are not limited.
+  none of it. The apply has a budget of the same size beside it, an upload applied at once has a
+  budget of its own, sized for a phone's download, and spends nothing of the other two, and the reads are not limited.
 - **The error taxonomy is `POST /dive/parse`'s.** 415 is "no reader here claims these
   bytes", 422 is "one did, and it failed", 413 is past a bound of the request or over the
   account's storage limit. A file that cannot be read is a row of the report, not a refusal
@@ -163,6 +163,18 @@ async def _enforce_apply_limit(user_id: int) -> None:
     await enforce_rate_limit(
         f"import-apply:user:{user_id}",
         settings.IMPORT_RATE_LIMIT_PER_USER,
+        settings.IMPORT_RATE_LIMIT_WINDOW_SECONDS,
+    )
+
+
+async def _enforce_at_once_limit(user_id: int) -> None:
+    """A third budget, apart from both: a phone sends an upload applied at once for each batch of
+    dives a download reads, which is far more often than anyone uploads or applies on the web, and
+    a download spending those budgets would refuse the diver's next import there. It counts
+    requests, not dives, so a refusal still reads no body."""
+    await enforce_rate_limit(
+        f"import-at-once:user:{user_id}",
+        settings.IMPORT_AT_ONCE_RATE_LIMIT_PER_USER,
         settings.IMPORT_RATE_LIMIT_WINDOW_SECONDS,
     )
 
@@ -318,8 +330,12 @@ async def create_logbook_import(
     `changes`, each member that differs, what it was and what it becomes: adding a file or a
     recording is a change even where no value of the dive moves. An `unchanged` row is a dive you
     have that the import leaves as it is, and a `skipped` row one it will not write, with its
-    `reason`. A dive you deleted here is skipped: no import brings one back, though a deleted
-    dive's recordings can still reach a dive you have, as a new dive's would.
+    `reason`. A dive, certification or service record you deleted is one you do not have: it is
+    created again under its identifier, and nothing the import says speaks of the deleted one. A
+    dive you merged into another is that dive, whether a document names its identifier, brings
+    one computer's reading of either record of it, or brings a file the merged dive holds; so is
+    any dive whose file you already hold. Such a dive's row is the dive's, and only a file it
+    lacks is added to it.
 
     Every other record lands in one of three buckets, per collection, summed over the files:
     **created**, **linked** (an existing record of yours already carries that identifier, or
@@ -344,10 +360,11 @@ async def create_logbook_import(
     inline image framed as it would be stored. It is absent when the archive's is your own,
     framed the same, and a portrait that cannot be offered is explained in the log.
 
-    A person this app exported linked to an account here is proposed linked to it again,
-    within the limit on linking people - an `account_linked` note names the account's
-    current username - where the account still exists, is not yours and no other person of
-    yours links it. Nothing of a link that cannot be made is kept.
+    A person this app exported connected to an account here is proposed connected to it
+    again, within the limit on connecting people - an `account_connected` note names the
+    account's current username - where the account still exists, is not yours, no other
+    person of yours is connected to it, and it has not disconnected you. That account then
+    sees you under its *Added you*. Nothing of a tie that cannot be made is kept.
 
     Species this instance's catalog did not hold are looked up in the World Register of Marine
     Species before the review is made, and stay in the catalog whatever becomes of the import.
@@ -368,9 +385,11 @@ async def create_logbook_import(
     yours while it was read is a 409 too, naming nothing where that other has already been
     finished.
 
-    Rate limited per account, on a budget of its own; with `apply=true` the request spends one of
-    the apply's budget too. A request over a budget it spends is a 429 and its body is not read,
-    and a repeat under an `Idempotency-Key` spends neither. A 413 when the files
+    Rate limited per account, on a budget of its own. With `apply=true` the request spends a
+    second budget instead, which neither an upload without it nor `POST /import/{uuid}/apply`
+    spends, and nothing of theirs. A
+    request over its budget is a 429 and its body is not read, and a repeat under an
+    `Idempotency-Key` spends nothing. A 413 when the files
     together are past what one import may carry or plan - its `detail` says which - and one
     naming the storage used and the limit when the files the import would store do not fit in
     what your account has left, measured as they would be stored and with your own portrait
@@ -413,8 +432,7 @@ async def _apply_at_once(
         held = await find_hold(db, user_id=user_id, route=route, key=idempotency_key)
         if held is not None:
             return await _replay(db, user_id, held)
-    await _enforce_import_limit(user_id)
-    await _enforce_apply_limit(user_id)
+    await _enforce_at_once_limit(user_id)
     await release_read_transaction(db)
     with await _read(request) as body, await _load(body.parts) as batch:
         newly_resolved = await resolve_catalog_gaps(db, aphia_ids=unresolved_aphia_ids(batch_species(batch)))
@@ -522,8 +540,11 @@ async def apply_logbook_import(
     cannot hold it beside what it now records. Everything else `changes` lists - a file, a
     recording, a profile, a position read from the files, a cylinder's link to a gear item - comes
     of the files themselves. What did not arrive is named by a note on the dive. A dive the
-    review showed that has since been deleted or merged away is skipped, and nothing is written
-    for it. A dive the review showed as
+    review showed that has since been deleted or merged away is what any import makes of its
+    files - a new dive, or the dive it was merged into - and is never held to the values the
+    review showed; its row reads that dive, with a note saying the review did not show it, and
+    is the same row as any other the review showed for that dive. Where its file cannot be read
+    at the apply, the row is skipped. A dive the review showed as
     `new` that reached your logbook another way in between takes the outcome and `uuid` of the
     dive that holds it. A dive the review did not show that the files now reach, the logbook
     having moved, is written too, and follows the rows the review showed with a note saying so.
@@ -544,9 +565,9 @@ async def apply_logbook_import(
     only while your portrait is still the one the review showed; otherwise yours is kept,
     and a note says so when you had chosen the archive's.
 
-    Each link to an account the import makes counts against the limit on linking people,
-    and one past it is dropped with a note rather than failing the import. A link counts
-    whether or not the import completes.
+    Each person the import connects to an account counts against the limit on connecting
+    people, and one past it arrives not connected, with a note, rather than failing the
+    import. It counts whether or not the import completes.
 
     A 409 when the import is already applied, or another device's apply got there first. Rate
     limited per account, on a budget of its own; a request over it is a 429 and writes nothing. Files

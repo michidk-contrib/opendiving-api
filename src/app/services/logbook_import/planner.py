@@ -18,9 +18,11 @@ Four rules run through everything below, and each is the format's rather than th
   object when the *caller* already owns it, and is remapped to a fresh one when it belongs
   to somebody else - so a cross-instance migration keeps identity and a cross-account copy
   gets its own.
-- **A record the caller deleted here stays deleted.** Its uuid is never written again, by
-  any import: the record is skipped and noted. A dive's recordings still go through the
-  recording match first, so one that belongs to a dive the caller still has reaches it.
+- **A record the caller deleted does not exist to an import.** It is created under its
+  uuid as though nothing claimed it, the deleted row giving that uuid up as it is written
+  and staying deleted, and nothing the import says speaks of it. A merge is not a deletion:
+  a dive merged into another resolves to the dive it joined, and so does a reading of one
+  record of a merged dive, or a file the logbook already holds.
 - **Nothing is invented** (spec §5.4). A member the document omits imports as absent; where
   the column cannot hold absent and no default honestly means "not recorded", the *record*
   is skipped and reported rather than filled in.
@@ -120,7 +122,7 @@ from ...schemas.tag import TAG_NAME_MAX, tag_key, trim_tag
 from ...schemas.user_picture import PictureCrop
 from ..certification_files import MAX_CARD_FILE_SIZE
 from ..commons_records import COMMONS_REGISTRY
-from ..dive_files import MAX_DIVE_FILE_SIZE, first_same_recording
+from ..dive_files import MAX_DIVE_FILE_SIZE, FileStarts, first_same_recording, merge_holding
 from ..dive_profiles import (
     IMPORT_PARSER_KEY,
     NormalizedProfile,
@@ -138,7 +140,14 @@ from ..dive_recordings import (
     load_candidates,
 )
 from ..libdivecomputer import LIBDIVECOMPUTER, Descriptor, descriptor_from, fallback_start_from
-from ..person_links import Account, accounts_by_uuid, claim_link_slot, link_budget_remaining
+from ..merged_dives import resolve_merges
+from ..person_connections import (
+    Account,
+    accounts_by_uuid,
+    claim_connect_slot,
+    connect_budget_remaining,
+    disconnected_by,
+)
 from ..recording_shape import INT32_MAX, Bound, Drop, bounded, finite, gate_figures, in_water_of, shape_recording
 from ..user_pictures import (
     MAX_PICTURE_UPLOAD_SIZE,
@@ -214,8 +223,6 @@ _MAX_SUBMERGED_TIME_SECONDS = 366 * 24 * 60 * 60
 # million again - below its column's width, as the count's is, and the sum still fits.
 _MAX_DIVE_TIME_SECONDS = _MAX_DIVE_COUNT * 3600
 
-DELETED_HERE = "You deleted this record here, so the import did not bring it back."
-
 
 @dataclass(slots=True)
 class MintedUuids:
@@ -262,6 +269,10 @@ class PlannedFile:
     # A dive-computer original's tag, kept on the row for its reader (`models/dive_file.py`).
     descriptor: Descriptor | None = None
     fallback_start: datetime | None = None
+    # The row of the same bytes a deleted dive still holds, which the writer moves onto the
+    # recording rather than storing the bytes a second time: to an import those bytes are not
+    # the account's, and once written they are held once.
+    moves: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,18 +342,21 @@ class PlannedRecording:
 class PlannedRecordingMatch:
     """An incoming recording that turned out to belong to a dive the caller already has.
 
-    Two kinds, and the difference is which gate admitted it. **`fill`** passed the
-    same-recording test: this is a second reading of a record that dive already holds - the
-    same computer exported twice - so it fills that recording's blanks, and the dive's, and
-    writes no new row. **`attach`** passed the strict same-dive test: a *different* computer
-    recorded the same dive, so a new recording is appended to that dive.
+    Three kinds, and the difference is what placed it. **`fill`** passed the same-recording
+    test: this is a second reading of a record that dive already holds - the same computer
+    exported twice - so it fills that recording's blanks, and the dive's, and writes no new
+    row. **`attach`** passed the strict same-dive test: a *different* computer recorded the
+    same dive, so a new recording is appended to that dive. **`belong`** is one record of a
+    merge's recording, or a recording whose file the account holds there: it is already that
+    recording, so nothing of it fills anything, and only the files the account does not hold
+    join the recording, unread.
 
     Neither creates a dive. Which is why a document dive whose every recording matched is not
     created either: there is nothing left of it that is not already in the logbook, and a
     second dive row would be the duplicate the gates exist to prevent.
     """
 
-    kind: Literal["fill", "attach"]
+    kind: Literal["fill", "attach", "belong"]
     dive_id: int
     dive_uuid: uuid_pkg.UUID
     source_uuid: uuid_pkg.UUID
@@ -426,6 +440,9 @@ class PlannedRecord:
     canonical_source_uuid: uuid_pkg.UUID | None = None
     values: dict[str, Any] = field(default_factory=dict)
     children: dict[str, Any] = field(default_factory=dict)
+    # The caller's deleted row under `uuid`, which the writer gives a uuid nothing else holds
+    # in the transaction that creates this record.
+    releases: int | None = None
 
 
 @dataclass(slots=True)
@@ -514,6 +531,16 @@ class _ExistingRow:
     # Null on a Commons record, the one row no account owns.
     user_id: int | None
     is_deleted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _HeldFile:
+    """Where a live dive of the caller's holds one set of bytes."""
+
+    recording_id: int
+    ordinal: int
+    dive_id: int
+    dive_uuid: uuid_pkg.UUID
 
 
 @dataclass(slots=True)
@@ -796,22 +823,20 @@ class _Planner:
         newly_resolved_aphia_ids: frozenset[int] = frozenset(),
         check_in: ImportCheckInSubmission | None = None,
         portrait: ImportPortraitChoice | None = None,
-        claim_links: bool = False,
+        claim_connections: bool = False,
         batch_dive_ids: frozenset[int] = frozenset(),
         held: Mapping[str, Callable[[], bytes]] | None = None,
-        gone_dives: frozenset[uuid_pkg.UUID] = frozenset(),
         minted: MintedUuids | None = None,
     ) -> None:
         self._db = db
-        # The document dives whose reviewed dive is no longer live: skipped before the recording
-        # gates, which read live dives alone and would make one of them a creation, or fill the
-        # survivor of a merge.
-        self._gone_dives = gone_dives
         self._minted = MintedUuids() if minted is None else minted
         # The bytes of the files earlier files of the same import stored, by storage key - not
         # in the store until the import has finished, and read by the same-recording gate when
         # a pair rests on a shared serial (`first_same_recording`).
         self._held = held
+        # The starts the gates read off stored recordings' files, so the merge test and the
+        # same-recording gate read one recording's files once.
+        self._file_starts: FileStarts = {}
         self._user_id = user_id
         self._loaded = loaded
         self._document = loaded.document
@@ -849,6 +874,14 @@ class _Planner:
         # `recording_id`, so it cannot serve two either. The file is skipped and reported; the
         # dive is not.
         self._claimed_digests: dict[str, int | None] = {}
+        # Of those the account holds, where each is on a live dive: what places a document
+        # recording no gate places (`_held_on`). And the file rows of the ones only a deleted
+        # dive holds, which are not the account's to an import (`PlannedFile.moves`).
+        self._held_on: dict[str, _HeldFile] = {}
+        self._released_files: dict[str, int] = {}
+        # The document's dive uuids that name a dive merged into one the caller has, whose link
+        # says so (`_through_merges`).
+        self._merged_away: set[uuid_pkg.UUID] = set()
         # Incoming recordings that belong to dives this account already has - see
         # `PlannedRecordingMatch`. Filled by `_plan_dives`, walked by the writer.
         self._recording_matches: list[PlannedRecordingMatch] = []
@@ -861,20 +894,22 @@ class _Planner:
         # Filled by `_plan_contacts`, which runs before anything that references a contact.
         self._contact_index: dict[tuple[str, ...], int] = {}
         self._contact_aliases: dict[tuple[str, ...], uuid_pkg.UUID] = {}
-        # The same for people by name, plus the accounts the caller's people link and the
-        # ones this document's have linked so far - a link claims a person before a name
-        # does. Filled by `_plan_people`, which runs before anything that references one.
+        # The same for people by name, plus the accounts the caller's people are connected to
+        # and the ones this document's have claimed so far - an account claims a person before
+        # a name does - and the accounts that have disconnected the caller. Filled by
+        # `_plan_people`, which runs before anything that references one.
         self._person_index: dict[tuple[str, ...], int] = {}
         self._person_aliases: dict[tuple[str, ...], uuid_pkg.UUID] = {}
-        self._linked_rows: dict[int, int] = {}
-        self._link_aliases: dict[int, uuid_pkg.UUID] = {}
+        self._connected_rows: dict[int, int] = {}
+        self._connect_aliases: dict[int, uuid_pkg.UUID] = {}
         self._accounts: dict[uuid_pkg.UUID, Account] = {}
-        # **Where a link's count is spent.** The apply claims one slot per link it makes, an
-        # exhausted window dropping that link rather than the import; the upload reads what
+        self._disconnected_by: set[int] = set()
+        # **Where a tie's count is spent.** The apply claims one slot per tie it makes, an
+        # exhausted window dropping that tie rather than the import; the upload reads what
         # the window has left and spends nothing, so the plan is made twice and counted once.
-        # Read on the first link the upload meets, so an import that links nobody never asks.
-        self._claim_links = claim_links
-        self._link_budget: int | None = None
+        # Read on the first tie the upload meets, so an import that connects nobody never asks.
+        self._claim_connections = claim_connections
+        self._connect_budget: int | None = None
         # The caller's tags by `tag_key`, the names of this document's diver's tag list, and
         # the tags this import makes - by key, each its first spelling. Filled by
         # `_plan_dives` and `_plan_tag_list`.
@@ -955,10 +990,11 @@ class _Planner:
 
         **Branching on `is_deleted` rather than filtering it is the whole point.** The
         repo's habitual `is_deleted=False` lookup would report a soft-deleted husk's uuid
-        as unclaimed, the import would create against it, and the *full* unique index on
-        `uuid` would refuse the insert - where the record the diver deleted is to be
-        skipped. No `user_id` filter either: a uuid owned by another account is what the
-        remap branch is for, and a query that could not see it would collide instead.
+        as unclaimed, and the *full* unique index on `uuid` would refuse the insert: the
+        record is created under that uuid only once the writer has given the husk another
+        (`PlannedRecord.releases`). No `user_id` filter either: a uuid owned by another
+        account is what the remap branch is for, and a query that could not see it would
+        collide instead.
         """
         if not uuids:
             return {}
@@ -1022,12 +1058,10 @@ class _Planner:
             return PlannedRecord(
                 action=Action.CREATE, source_uuid=source_uuid, uuid=self._minted.mint(collection, source_uuid)
             )
-        # The caller's own row, and deleted, since `_linked` answers for a live one.
-        return self._skip(collection, source_uuid, DELETED_HERE)
-
-    def _deleted_here(self, source_uuid: uuid_pkg.UUID, existing: dict[uuid_pkg.UUID, _ExistingRow]) -> bool:
-        row = existing.get(source_uuid)
-        return row is not None and row.user_id == self._user_id and row.is_deleted
+        # The caller's own row, and deleted, since `_linked` answers for a live one. To an
+        # import a deleted record does not exist: the record is created under its uuid, and
+        # the deleted row gives that uuid up when it is written, staying deleted.
+        return PlannedRecord(action=Action.CREATE, source_uuid=source_uuid, uuid=source_uuid, releases=row.id)
 
     def _linked(
         self, collection: str, source_uuid: uuid_pkg.UUID, existing: dict[uuid_pkg.UUID, _ExistingRow]
@@ -1045,7 +1079,9 @@ class _Planner:
             return None
         self._note(
             ImportNoteCode.RECORD_LINKED,
-            "This record is already in your logbook under the same identifier, so nothing was written for it.",
+            "This dive is one you merged into this one, so nothing was written for it."
+            if collection == "dives" and source_uuid in self._merged_away
+            else "This record is already in your logbook under the same identifier, so nothing was written for it.",
             collection=collection,
             uuid=source_uuid,
         )
@@ -1622,23 +1658,25 @@ class _Planner:
         people = self._document.people
         existing = await self._rows_by_uuid(Person, [person.uuid for person in people])
         self._person_index = await self._existing_by_key(Person, (Person.name,), lambda row: _key(row[0]))
-        linked = await self._db.execute(
-            select(Person.linked_user_id, Person.id).where(
-                Person.user_id == self._user_id, Person.linked_user_id.is_not(None)
+        connected = await self._db.execute(
+            select(Person.connected_user_id, Person.id).where(
+                Person.user_id == self._user_id, Person.connected_user_id.is_not(None)
             )
         )
-        self._linked_rows = {row.linked_user_id: row.id for row in linked}
+        self._connected_rows = {row.connected_user_id: row.id for row in connected}
         self._accounts = await accounts_by_uuid(
             self._db, [account for person in people if (account := _person_account(person)) is not None]
         )
+        if self._accounts:
+            self._disconnected_by = await disconnected_by(self._db, diver_id=self._user_id)
         for person in people:
             self._claim_document_uuid("people", person)
             self._records["people"][person.uuid] = await self._plan_person(person, existing)
 
     async def _plan_person(self, person: ImportPerson, existing: dict[uuid_pkg.UUID, _ExistingRow]) -> PlannedRecord:
         """One person: the uuid rules, then - for a record this import would create - a claim
-        by link before a claim by name. A person whose entry names an account another of the
-        caller's people already links is that person, whatever its name says."""
+        by account before a claim by name. A person whose entry names an account another of the
+        caller's people is already connected to is that person, whatever its name says."""
         collection = "people"
         if (linked := self._linked(collection, person.uuid, existing)) is not None:
             return linked
@@ -1648,21 +1686,21 @@ class _Planner:
         record = self._resolve(collection, person.uuid, existing)
         account = self._accounts.get(account_uuid) if (account_uuid := _person_account(person)) else None
         if record.action is Action.CREATE and account is not None:
-            row_id = self._linked_rows.get(account.id)
+            row_id = self._connected_rows.get(account.id)
             if row_id is not None:
                 self._note(
                     ImportNoteCode.RECORD_LINKED,
-                    "You already have a person linked to the account this one names, so this record was linked to "
+                    "You already have a person connected to the account this one names, so this record was linked to "
                     "them rather than duplicated.",
                     collection=collection,
                     uuid=person.uuid,
                 )
                 return PlannedRecord(action=Action.LINK, source_uuid=person.uuid, uuid=person.uuid, row_id=row_id)
-            owner = self._link_aliases.get(account.id)
+            owner = self._connect_aliases.get(account.id)
             if owner is not None:
                 self._note(
                     ImportNoteCode.RECORD_LINKED,
-                    "This document carries two people linked to one account; they were imported as one.",
+                    "This document carries two people connected to one account; they were imported as one.",
                     collection=collection,
                     uuid=person.uuid,
                 )
@@ -1689,66 +1727,69 @@ class _Planner:
             "email": self._email(collection, person.uuid, person.email),
             "phone": person.phone,
             "notes": self._notes_text(collection, person.uuid, person.notes),
-            "linked_user_id": await self._account_link(person, account_uuid, account),
+            "connected_user_id": await self._account_connection(person, account_uuid, account),
             "created_at": self._created_at(person.created_at),
         }
         return record
 
-    async def _account_link(
+    async def _account_connection(
         self, person: ImportPerson, account_uuid: uuid_pkg.UUID | None, account: Account | None
     ) -> int | None:
-        """The account a new person links to, from its entry under this producer's key - under
-        the caller's link limit, as a typed username is, and named in the report.
+        """The account a new person is connected to, from its entry under this producer's key -
+        under the caller's limit on connecting people, and named in the report.
 
-        Only an account the username resolver would take: one on this instance (a deleted one
-        in its grace period included), not the caller's, not linked by another of their people.
-        Anything else is dropped with a note and nothing of it is kept.
+        Only an account on this instance (a deleted one in its grace period included), not the
+        caller's, not connected to another of their people, and not one that has disconnected
+        the caller. Anything else is dropped with a note and nothing of it is kept; the last
+        reads as the first does, word for word, so the caller is not told of the disconnect.
         """
         if account_uuid is None:
             return None
-        if account is None:
+        if account is None or account.id in self._disconnected_by:
             self._dropped(
                 "people",
                 person.uuid,
-                "The account this person was linked to is not on this instance, so the person arrives unlinked",
+                "The account this person was connected to is not on this instance, so the person arrives not connected",
             )
             return None
         if account.id == self._user_id:
             self._dropped(
-                "people", person.uuid, "This person was linked to your own account, so the person arrives unlinked"
+                "people",
+                person.uuid,
+                "This person was connected to your own account, so the person arrives not connected",
             )
             return None
-        if account.id in self._linked_rows or account.id in self._link_aliases:
+        if account.id in self._connected_rows or account.id in self._connect_aliases:
             self._dropped(
                 "people",
                 person.uuid,
-                "Another of your people is linked to the account this one names, so this one arrives unlinked",
+                "Another of your people is connected to the account this one names, so this one arrives not connected",
             )
             return None
-        if self._claim_links:
-            if not await claim_link_slot(self._user_id):
+        if self._claim_connections:
+            if not await claim_connect_slot(self._user_id):
                 self._dropped(
                     "people",
                     person.uuid,
-                    "This import is past the limit on linking people, so this one arrives unlinked",
+                    "This import is past the limit on connecting people, so this one arrives not connected",
                 )
                 return None
         else:
-            if self._link_budget is None:
-                self._link_budget = await link_budget_remaining(self._user_id)
-            if self._link_budget <= 0:
+            if self._connect_budget is None:
+                self._connect_budget = await connect_budget_remaining(self._user_id)
+            if self._connect_budget <= 0:
                 self._dropped(
                     "people",
                     person.uuid,
-                    "This import is past the limit on linking people, so this one would arrive unlinked",
+                    "This import is past the limit on connecting people, so this one would arrive not connected",
                 )
                 return None
-            self._link_budget -= 1
-        self._link_aliases[account.id] = person.uuid
+            self._connect_budget -= 1
+        self._connect_aliases[account.id] = person.uuid
         self._note(
-            ImportNoteCode.ACCOUNT_LINKED,
-            f"This person {'was' if self._claim_links else 'will be'} linked to @{account.username}, the account on "
-            "this instance the document names.",
+            ImportNoteCode.ACCOUNT_CONNECTED,
+            f"This person {'was' if self._claim_connections else 'will be'} connected to @{account.username}, the "
+            "account on this instance the document names.",
             collection="people",
             uuid=person.uuid,
         )
@@ -1815,7 +1856,7 @@ class _Planner:
                 "email": None,
                 "phone": None,
                 "notes": "",
-                "linked_user_id": None,
+                "connected_user_id": None,
                 "created_at": datetime.now(UTC),
             },
         )
@@ -2537,17 +2578,33 @@ class _Planner:
 
     async def _plan_dives(self) -> None:
         existing = await self._rows_by_uuid(Dive, [dive.uuid for dive in self._document.dives])
-        self._claimed_digests = await self._stored_digests()
+        existing.update(await self._through_merges(existing))
+        await self._stored_digests()
         for dive in self._document.dives:
             self._claim_document_uuid("dives", dive)
             self._records["dives"][dive.uuid] = await self._plan_dive(dive, existing)
 
-    async def _stored_digests(self) -> dict[str, int | None]:
+    async def _through_merges(self, existing: dict[uuid_pkg.UUID, _ExistingRow]) -> dict[uuid_pkg.UUID, _ExistingRow]:
+        """The caller's deleted dives that were merged into a dive they still have, each as that
+        dive: a merge is not a deletion, and a uuid resolves through it to the dive it joined."""
+        deleted = [uuid for uuid, row in existing.items() if row.user_id == self._user_id and row.is_deleted]
+        if not deleted:
+            return {}
+        merged = {
+            uuid: _ExistingRow(id=target.id, user_id=self._user_id, is_deleted=False)
+            for uuid, target in (await resolve_merges(self._db, user_id=self._user_id, uuids=deleted)).items()
+            if not target.is_deleted
+        }
+        self._merged_away.update(merged)
+        return merged
+
+    async def _stored_digests(self) -> None:
         """Which of the digests this file could store the account holds already, and where.
 
         The kept file's own and an archive's members' - asked by digest rather than read for
         the whole account, because an import of many files asks once per file, against a
-        logbook each earlier file has just grown.
+        logbook each earlier file has just grown. Bytes only a deleted dive holds are not the
+        account's to an import: a record that brings them stores them, by moving that row.
         """
         wanted = [] if self._loaded.kept is None else [self._loaded.kept.sha256]
         if self._loaded.is_archive:
@@ -2558,18 +2615,33 @@ class _Planner:
                 for stored in recording.source_files
                 if stored is not None and stored.sha256 is not None
             )
-        held: dict[str, int | None] = {}
         unique = sorted(set(wanted))
         for start in range(0, len(unique), _DIGESTS_PER_QUERY):
             rows = await self._db.execute(
-                select(DiveFile.sha256, DiveFile.recording_id).where(
+                select(
+                    DiveFile.sha256,
+                    DiveFile.id,
+                    DiveFile.recording_id,
+                    DiveRecording.ordinal,
+                    Dive.id.label("dive_id"),
+                    Dive.uuid.label("dive_uuid"),
+                    Dive.is_deleted,
+                )
+                .join(DiveRecording, DiveRecording.id == DiveFile.recording_id)
+                .join(Dive, Dive.id == DiveRecording.dive_id)
+                .where(
                     DiveFile.user_id == self._user_id,
                     DiveFile.sha256.in_(unique[start : start + _DIGESTS_PER_QUERY]),
                 )
             )
             for row in rows:
-                held[row.sha256] = row.recording_id
-        return held
+                if row.is_deleted:
+                    self._released_files[row.sha256] = row.id
+                    continue
+                self._claimed_digests[row.sha256] = row.recording_id
+                self._held_on[row.sha256] = _HeldFile(
+                    recording_id=row.recording_id, ordinal=row.ordinal, dive_id=row.dive_id, dive_uuid=row.dive_uuid
+                )
 
     async def _load_candidates(self, around: datetime) -> list[RecordingCandidate]:
         """This account's recordings near one incoming start.
@@ -2621,11 +2693,12 @@ class _Planner:
         self,
         dive: ImportDive,
         recordings: list[PlannedRecording],
+        sources: list[ImportRecording],
         values: dict[str, Any],
         mixtures: list[dict[str, Any]],
     ) -> tuple[list[PlannedRecording], int]:
-        """Attach what belongs to a dive the caller already has; return what is left and how
-        many were taken.
+        """Place what belongs to a dive the caller already has, plan every recording's files,
+        and return what is left with its files and how many were taken.
 
         **The count is not `len(recordings) - len(remaining)`**, and that is the whole reason
         it is returned rather than derived: a recording can also leave this list by having
@@ -2633,96 +2706,58 @@ class _Planner:
         would take "one unusable recording" for "one recording already in the logbook" and
         skip a dive it should have created.
 
-        **Same-recording first, then same-dive-strict**, and the order is the whole of the
-        rule: a file that is a second reading of a record the logbook already holds must fill
-        that record rather than be appended beside it as though a second computer had
-        recorded it. The loose gate is not used here at all - it is a form's, where a diver
-        decides - because an import that attached on a start window alone would silently fold
-        a repetitive dive into the one before it.
+        **A merge's recording first, then same-recording, then same-dive-strict, then the
+        bytes**, and the order is the whole of the rule. A reading of one record of a merged
+        dive belongs to that dive (`merge_holding`), before the same-recording gate could fill
+        the merge from half of it. A file that is a second reading of a record the logbook
+        already holds must fill that record rather than be appended beside it as though a
+        second computer had recorded it. The loose gate is not used here at all - it is a
+        form's, where a diver decides - because an import that attached on a start window
+        alone would silently fold a repetitive dive into the one before it. And a recording
+        none of them places, whose file the account holds on a recording of a live dive,
+        belongs to that recording: which is what finds a merge made before merges were
+        recorded, whatever its recording names.
 
         The dive's own *values* ride along on a `fill` only, so a match can still supply
         readings the stored dive has none of; on an `attach` they are dropped, the recording
         being a second computer's and the dive's figures the primary recording's. Its
         **cylinders** ride along on both: on either they fill the blanks of the dive's rows
         they pair with, and on an attach they are also what the second computer's
-        `gas_number`s are mapped *from*.
+        `gas_number`s are mapped *from*. A `belong` carries neither.
+
+        The files are planned once every recording is placed, in the document's order, so a
+        file the account holds on the recording its own belongs to is no news.
         """
-        remaining: list[PlannedRecording] = []
         taken = 0
         # Each match's index in `_recording_matches`, beside the stored recording it reached.
-        matches: list[tuple[int, RecordingCandidate]] = []
-        for recording in recordings:
-            if recording.start_time is None:
-                remaining.append(recording)
+        matches: list[tuple[int, RecordingCandidate | None]] = []
+        # Where each recording went, by its index here: the match's index, or `None` for one left.
+        placed: list[int | None] = []
+        for index, recording in enumerate(recordings):
+            match, candidate = await self._placement(dive, index, recording, sources[index], values, mixtures)
+            if match is None:
+                placed.append(None)
                 continue
+            self._recording_matches.append(match)
+            matches.append((len(self._recording_matches) - 1, candidate))
+            placed.append(len(self._recording_matches) - 1)
+            taken += 1
+        if not recordings and (held := self._kept_held()) is not None:
+            # A logbook entry with no recording, whose file the account holds: its dive.
+            self._recording_matches.append(self._belonging(dive, PlannedRecording(ordinal=0), held))
+            matches.append((len(self._recording_matches) - 1, None))
+            taken += 1
 
-            incoming = RecordingFacts(
-                device=DeviceIdentity(
-                    brand=recording.device.get("device_brand"),
-                    model=recording.device.get("device_model"),
-                    serial=recording.device.get("device_serial"),
-                    dive_number=recording.device.get("device_dive_number"),
-                ),
-                start_time=recording.start_time,
-                utc_offset_minutes=recording.utc_offset_minutes,
-                duration=recording.duration,
-                max_depth=recording.max_depth,
-                sampled_span=None if recording.profile is None else recording.profile.profile.duration,
-            )
-            candidates = await self._load_candidates(recording.start_time)
-
-            filled = await first_same_recording(self._db, incoming, candidates, held=self._held)
-            if filled is not None:
-                self._recording_matches.append(
-                    PlannedRecordingMatch(
-                        kind="fill",
-                        dive_id=filled.dive_id,
-                        dive_uuid=filled.dive_uuid,
-                        source_uuid=dive.uuid,
-                        recording_id=filled.id,
-                        recording=recording,
-                        ordinal=filled.ordinal,
-                        # Settled below, once it is known whether the imported file joins it.
-                        replaces_profile=False,
-                        dive_values=values,
-                        mixtures=mixtures,
-                    )
-                )
-                matches.append((len(self._recording_matches) - 1, filled))
-                taken += 1
+        remaining: list[PlannedRecording] = []
+        for index, (recording, source) in enumerate(zip(recordings, sources, strict=True)):
+            at = placed[index]
+            if at is None:
+                remaining.append(replace(recording, files=self._plan_recording_files(dive, source)))
                 continue
-
-            attached = next(
-                (candidate for candidate in candidates if is_same_dive_strict(incoming, candidate.facts)), None
-            )
-            if attached is not None:
-                self._recording_matches.append(
-                    PlannedRecordingMatch(
-                        kind="attach",
-                        dive_id=attached.dive_id,
-                        dive_uuid=attached.dive_uuid,
-                        source_uuid=dive.uuid,
-                        recording_id=None,
-                        recording=recording,
-                        # No stored recording to have a position: the writer appends this one
-                        # and computes the slot with `next_ordinal`.
-                        ordinal=None,
-                        replaces_profile=False,
-                        # **Carried on an attach as well as on a fill**, and with one more
-                        # job: the writer maps this second computer's `gas_number`s from them
-                        # onto the ones the dive already has, as well as filling the blanks of
-                        # the rows they pair with. Without them the mapping has nothing to map
-                        # from and the recording's pressure channels land naming another
-                        # computer's tanks - the misattribution `relabel_gas_numbers` exists
-                        # to prevent.
-                        mixtures=mixtures,
-                    )
-                )
-                matches.append((len(self._recording_matches) - 1, attached))
-                taken += 1
-                continue
-
-            remaining.append(recording)
+            match = self._recording_matches[at]
+            on = match.recording_id if match.kind == "belong" else None
+            files = self._plan_recording_files(dive, source, on=on)
+            self._recording_matches[at] = replace(match, recording=replace(recording, files=files))
 
         # The imported file joins the first match where every recording matched and it is not
         # stored already (`_keep_on_match`), and a fill it joins is re-derived from its files.
@@ -2730,6 +2765,8 @@ class _Planner:
         joins = kept is not None and taken > 0 and not remaining and kept.sha256 not in self._claimed_digests
         for index, candidate in matches:
             match = self._recording_matches[index]
+            if match.kind == "belong" or candidate is None:
+                continue
             noted = candidate.dive_id not in self._batch_dive_ids
             # `0` is the placeholder a dive imported before imports numbered their dives still
             # holds, not a number the diver gave it.
@@ -2765,12 +2802,122 @@ class _Planner:
             )
         return remaining, taken
 
+    async def _placement(
+        self,
+        dive: ImportDive,
+        index: int,
+        recording: PlannedRecording,
+        source: ImportRecording,
+        values: dict[str, Any],
+        mixtures: list[dict[str, Any]],
+    ) -> tuple[PlannedRecordingMatch | None, RecordingCandidate | None]:
+        """Where one document recording goes, if it is a dive the caller has, and the stored
+        recording a gate matched it to."""
+        if recording.start_time is not None:
+            incoming = RecordingFacts(
+                device=DeviceIdentity(
+                    brand=recording.device.get("device_brand"),
+                    model=recording.device.get("device_model"),
+                    serial=recording.device.get("device_serial"),
+                    dive_number=recording.device.get("device_dive_number"),
+                ),
+                start_time=recording.start_time,
+                utc_offset_minutes=recording.utc_offset_minutes,
+                duration=recording.duration,
+                max_depth=recording.max_depth,
+                sampled_span=None if recording.profile is None else recording.profile.profile.duration,
+            )
+            candidates = await self._load_candidates(recording.start_time)
+
+            merged = await merge_holding(self._db, incoming, candidates, held=self._held, starts=self._file_starts)
+            if merged is not None:
+                merge = _HeldFile(
+                    recording_id=merged.id, ordinal=merged.ordinal, dive_id=merged.dive_id, dive_uuid=merged.dive_uuid
+                )
+                return self._belonging(dive, recording, merge), None
+
+            filled = await first_same_recording(
+                self._db, incoming, candidates, held=self._held, starts=self._file_starts
+            )
+            if filled is not None:
+                fill = PlannedRecordingMatch(
+                    kind="fill",
+                    dive_id=filled.dive_id,
+                    dive_uuid=filled.dive_uuid,
+                    source_uuid=dive.uuid,
+                    recording_id=filled.id,
+                    recording=recording,
+                    ordinal=filled.ordinal,
+                    # Settled by the caller, once it is known whether the imported file joins it.
+                    replaces_profile=False,
+                    dive_values=values,
+                    mixtures=mixtures,
+                )
+                return fill, filled
+
+            attached = next(
+                (candidate for candidate in candidates if is_same_dive_strict(incoming, candidate.facts)), None
+            )
+            if attached is not None:
+                attach = PlannedRecordingMatch(
+                    kind="attach",
+                    dive_id=attached.dive_id,
+                    dive_uuid=attached.dive_uuid,
+                    source_uuid=dive.uuid,
+                    recording_id=None,
+                    recording=recording,
+                    # No stored recording to have a position: the writer appends this one
+                    # and computes the slot with `next_ordinal`.
+                    ordinal=None,
+                    replaces_profile=False,
+                    # **Carried on an attach as well as on a fill**, and with one more
+                    # job: the writer maps this second computer's `gas_number`s from them
+                    # onto the ones the dive already has, as well as filling the blanks of
+                    # the rows they pair with. Without them the mapping has nothing to map
+                    # from and the recording's pressure channels land naming another
+                    # computer's tanks - the misattribution `relabel_gas_numbers` exists
+                    # to prevent.
+                    mixtures=mixtures,
+                )
+                return attach, attached
+
+        held = next(
+            (self._held_on[digest] for digest in self._recording_digests(index, source) if digest in self._held_on),
+            None,
+        )
+        return (None, None) if held is None else (self._belonging(dive, recording, held), None)
+
+    def _recording_digests(self, index: int, source: ImportRecording) -> list[str]:
+        """The digests of a document recording's files: the imported file's, where it is this
+        one recording's, and those its archive carries for it."""
+        digests = [self._loaded.kept.sha256] if self._loaded.kept is not None and index == 0 else []
+        if self._loaded.is_archive:
+            digests.extend(
+                stored.sha256
+                for stored in source.source_files
+                if stored is not None and stored.archive_path is not None and stored.sha256 is not None
+            )
+        return digests
+
+    def _kept_held(self) -> _HeldFile | None:
+        kept = self._loaded.kept
+        return None if kept is None else self._held_on.get(kept.sha256)
+
+    @staticmethod
+    def _belonging(dive: ImportDive, recording: PlannedRecording, held: _HeldFile) -> PlannedRecordingMatch:
+        return PlannedRecordingMatch(
+            kind="belong",
+            dive_id=held.dive_id,
+            dive_uuid=held.dive_uuid,
+            source_uuid=dive.uuid,
+            recording_id=held.recording_id,
+            recording=recording,
+            ordinal=held.ordinal,
+            replaces_profile=False,
+        )
+
     async def _plan_dive(self, dive: ImportDive, existing: dict[uuid_pkg.UUID, _ExistingRow]) -> PlannedRecord:
         collection = "dives"
-        if dive.uuid in self._gone_dives:
-            self._count_unwritten_files(dive)
-            self._not_writing_the_file()
-            return self._skip(collection, dive.uuid, DELETED_HERE)
         if (linked := self._linked(collection, dive.uuid, existing)) is not None:
             self._count_unwritten_files(dive)
             self._not_writing_the_file()
@@ -2780,15 +2927,7 @@ class _Planner:
             self._not_writing_the_file()
             return self._skip(collection, dive.uuid, "A dive needs a start time, and this one has none.")
 
-        # A dive the caller deleted here is planned as far as the recording gates, and no
-        # further: its recordings may belong to a dive they still have, and the dive itself
-        # is never written (`_plan_deleted_dive`).
-        deleted = self._deleted_here(dive.uuid, existing)
-        record = (
-            PlannedRecord(action=Action.SKIP, source_uuid=dive.uuid, uuid=dive.uuid)
-            if deleted
-            else self._resolve(collection, dive.uuid, existing)
-        )
+        record = self._resolve(collection, dive.uuid, existing)
 
         bounded = self._bounded(collection, dive.uuid, dive, DIVE_BOUNDS)
         recordings, sources = self._plan_recordings(dive)
@@ -2827,15 +2966,6 @@ class _Planner:
                 "A dive needs a dive time, and this one carries neither a dive time nor a profile to take one from. "
                 "Nothing was invented for it.",
             )
-        # Only now that the dive is written: a file planned for a skipped one would be
-        # counted restored and claim a digest a later dive's copy needs. A deleted dive's
-        # recordings get theirs only once the gates have placed them.
-        if not deleted:
-            recordings = [
-                replace(recording, files=self._plan_recording_files(dive, source))
-                for recording, source in zip(recordings, sources, strict=True)
-            ]
-
         max_depth, avg_depth = bounded.get("max_depth"), bounded.get("avg_depth")
         if avg_depth is None and dive.avg_depth is None and in_water is not None:
             avg_depth = float(in_water.avg_depth)
@@ -2916,33 +3046,29 @@ class _Planner:
         mixtures = self._plan_cylinders(dive)
 
         # **The gates run before a dive is created, and only for a uuid the caller does not
-        # hold live.** A `LINK` is a dive they already have - matching it against the logbook
-        # would be asking whether a dive is itself. `CREATE` covers the genuinely new dive, the
-        # remapped one and one whose identity the file's own bytes gave it, and the remapped
-        # case is where this matters most: another account's export carries uuids that mean
-        # nothing here, so uuid matching has nothing to work with and the device and the clock
-        # are all there is.
-        if deleted:
-            already = len(self._recording_matches)
-            remaining, matched = await self._match_recordings(dive, recordings, record.values, mixtures)
-            return self._plan_deleted_dive(
-                dive, already, matched, remaining, dict(zip(map(id, recordings), sources, strict=True))
-            )
-        if record.action is Action.CREATE:
-            already = len(self._recording_matches)
-            recordings, matched = await self._match_recordings(dive, recordings, record.values, mixtures)
-            if matched and not recordings:
-                # Every recording of this dive is now on a dive the caller already has, so
-                # there is nothing left for a dive row to hold. Creating one would be the
-                # duplicate the gates exist to prevent. The notes above already say which
-                # dive each recording reached.
-                #
-                # `matched` rather than "the document listed recordings": a dive whose only
-                # recording was *dropped* for describing nothing still has everything else
-                # the document says about it, and skipping it would lose a real dive over an
-                # unusable object inside it.
-                self._keep_on_match(already)
-                return PlannedRecord(action=Action.SKIP, source_uuid=dive.uuid, uuid=record.uuid)
+        # hold live** - nor through a merge, which `_through_merges` reads as live. A `LINK` is
+        # a dive they already have - matching it against the logbook would be asking whether a
+        # dive is itself. `CREATE` covers the genuinely new dive, the remapped one, one whose
+        # identity the file's own bytes gave it and one under the uuid of a dive the caller
+        # deleted, and the remapped case is where this matters most: another account's export
+        # carries uuids that mean nothing here, so uuid matching has nothing to work with and
+        # the device and the clock are all there is. The files are planned only now that the
+        # dive is written: a file planned for a skipped one would be counted restored and claim
+        # a digest a later dive's copy needs.
+        already = len(self._recording_matches)
+        recordings, matched = await self._match_recordings(dive, recordings, sources, record.values, mixtures)
+        if matched and not recordings:
+            # Every recording of this dive is now on a dive the caller already has, so
+            # there is nothing left for a dive row to hold. Creating one would be the
+            # duplicate the gates exist to prevent. The notes above already say which
+            # dive each recording reached.
+            #
+            # `matched` rather than "the document listed recordings": a dive whose only
+            # recording was *dropped* for describing nothing still has everything else
+            # the document says about it, and skipping it would lose a real dive over an
+            # unusable object inside it.
+            self._keep_on_match(already)
+            return PlannedRecord(action=Action.SKIP, source_uuid=dive.uuid, uuid=record.uuid)
         for message in derived:
             self._note(ImportNoteCode.VALUE_DERIVED, message, collection=collection, uuid=dive.uuid)
         if stated_temperature is None and temperature is not None:
@@ -2972,33 +3098,6 @@ class _Planner:
         if number is None:
             self._unnumbered_dives.append(dive.uuid)
         return record
-
-    def _plan_deleted_dive(
-        self,
-        dive: ImportDive,
-        already: int,
-        matched: int,
-        remaining: list[PlannedRecording],
-        source_of: dict[int, ImportRecording],
-    ) -> PlannedRecord:
-        """Skip a dive the caller deleted here, after the gates placed what they could.
-
-        A recording that matched a live dive goes to it with its files, as a new dive's
-        would: a dive downloaded again after the diver deleted it and logged the same dive
-        from another source fills that one. One that matched nothing goes with the dive.
-        """
-        # `source_of` is keyed on the planned recordings' identity: the gates hand back the very
-        # objects they were given, matched or not.
-        for index in range(already, len(self._recording_matches)):
-            match = self._recording_matches[index]
-            files = self._plan_recording_files(dive, source_of[id(match.recording)])
-            self._recording_matches[index] = replace(match, recording=replace(match.recording, files=files))
-        self._count_unwritten(stored for recording in remaining for stored in source_of[id(recording)].source_files)
-        if matched and not remaining:
-            self._keep_on_match(already)
-        else:
-            self._not_writing_the_file()
-        return self._skip("dives", dive.uuid, DELETED_HERE)
 
     def _tag_names(
         self, names: Sequence[str], *, collection: str | None = None, record_uuid: uuid_pkg.UUID | None = None
@@ -3211,12 +3310,15 @@ class _Planner:
             sources.append(source)
         return planned, sources
 
-    def _plan_recording_files(self, dive: ImportDive, source: ImportRecording) -> list[PlannedFile]:
-        """The archive's files behind one recording of a dive this import writes."""
+    def _plan_recording_files(
+        self, dive: ImportDive, source: ImportRecording, *, on: int | None = None
+    ) -> list[PlannedFile]:
+        """The archive's files behind one recording of a dive this import writes, or of the
+        stored recording `on` it belongs to."""
         return [
             planned_file
             for stored in source.source_files
-            if (planned_file := self._plan_dive_file(dive, stored)) is not None
+            if (planned_file := self._plan_dive_file(dive, stored, on=on)) is not None
         ]
 
     # ------------------------------------------------------------------ files
@@ -3229,7 +3331,7 @@ class _Planner:
         import creates. A file whose bytes the recording it reaches already holds is a repeat
         and adds nothing, without a note; one whose bytes another recording of the account
         holds is skipped with the note an archive's file gets, since a file belongs to one
-        recording.
+        recording. Bytes only a deleted dive holds are the account's no longer, and are kept.
         """
         kept = self._loaded.kept
         if kept is None:
@@ -3253,6 +3355,7 @@ class _Planner:
             original_filename=kept.filename,
             content_type=content_type_of(kept.format),
             parser_key=kept.format,
+            moves=self._released_files.pop(kept.sha256, None),
         )
 
     def _keep_on_match(self, already: int) -> None:
@@ -3321,8 +3424,13 @@ class _Planner:
             else:
                 self._files_not_contained += 1
 
-    def _plan_dive_file(self, dive: ImportDive, stored: ImportStoredFile | None) -> PlannedFile | None:
+    def _plan_dive_file(
+        self, dive: ImportDive, stored: ImportStoredFile | None, *, on: int | None = None
+    ) -> PlannedFile | None:
         """One dive-computer export behind a recording, when the container carries its bytes.
+
+        `on` is the stored recording the document's belongs to, whose own files are no news.
+        Bytes only a deleted dive holds are the account's no longer, and are restored.
 
         **A bare document never creates a file row.** It carries the metadata and none of
         the bytes, and in this repo a file row's existence is the claim that the bytes
@@ -3378,6 +3486,8 @@ class _Planner:
             # names one `recording_id`, so one set of bytes cannot serve two recordings. The
             # recording keeps everything else and simply has that file missing.
             self._files_skipped += 1
+            if on is not None and self._claimed_digests[stored.sha256] == on:
+                return None
             self._note(
                 ImportNoteCode.FILE_SKIPPED,
                 "You already store an identical dive-computer file against another recording, and a file belongs to "
@@ -3388,6 +3498,7 @@ class _Planner:
             return None
 
         self._claimed_digests[stored.sha256] = None
+        moves = self._released_files.pop(stored.sha256, None)
         self._files_restored += 1
         # The format the document says read the file, when this build's reader reads it: a
         # backfill can then re-read the restored file, and the content type comes from this
@@ -3397,9 +3508,11 @@ class _Planner:
         #
         # A dive-computer original reads only with the descriptor its tag carries, so one
         # without a usable descriptor is restored as the import's own key too, as an untagged
-        # one is: nothing could ever read it. One with a descriptor keeps its key and tag even
-        # where this process has no `divejson-raw`, as a stored one does: the bytes cannot give
-        # the tag back, and a reader installed later reads it.
+        # one is: nothing reads it. Revision `36f9496a7b33` labelled, from their recordings'
+        # models, the untagged `.bin` files stored before the phone tagged them; one an archive
+        # restores now stays unread. One with a descriptor keeps its key and tag even where this
+        # process has no `divejson-raw`, as a stored one does: the bytes cannot give the tag
+        # back, and a reader installed later reads it.
         parser_key = _producer_entry(stored, "parser_key")
         descriptor = fallback_start = None
         if parser_key == LIBDIVECOMPUTER:
@@ -3416,6 +3529,7 @@ class _Planner:
             parser_key=parser_key if readable else IMPORT_PARSER_KEY,
             descriptor=descriptor if readable else None,
             fallback_start=fallback_start if readable else None,
+            moves=moves,
         )
 
     def _plan_card_file(
@@ -3539,21 +3653,19 @@ async def plan_import(
     newly_resolved_aphia_ids: frozenset[int] = frozenset(),
     check_in: ImportCheckInSubmission | None = None,
     portrait: ImportPortraitChoice | None = None,
-    claim_links: bool = False,
+    claim_connections: bool = False,
     batch_dive_ids: frozenset[int] = frozenset(),
     held: Mapping[str, Callable[[], bytes]] | None = None,
-    gone_dives: frozenset[uuid_pkg.UUID] = frozenset(),
     minted: MintedUuids | None = None,
 ) -> ImportPlan:
     """Plan an import of `loaded` into `user_id`'s logbook. Writes nothing to the database.
 
     `check_in` and `portrait` are what the diver confirmed in the review; the apply passes
-    them and the upload, which has nothing submitted yet, does not. `claim_links` is the
-    apply's too: it spends the link limit for each person it links, where the upload only
-    reads what is left of it. `batch_dive_ids` are the dives the files before this one in the
-    same import wrote, and `held` the bytes of the files they stored. `gone_dives` and `minted`
-    are the apply's as well: the document dives the review's dives no longer stand for, and the
-    uuids the upload's pass minted for this file.
+    them and the upload, which has nothing submitted yet, does not. `claim_connections` is
+    the apply's too: it spends the limit on connecting people for each person it connects,
+    where the upload only reads what is left of it. `batch_dive_ids` are the dives the files
+    before this one in the same import wrote, and `held` the bytes of the files they stored.
+    `minted` is the apply's as well: the uuids the upload's pass minted for this file.
     """
     planner = _Planner(
         db,
@@ -3563,10 +3675,9 @@ async def plan_import(
         newly_resolved_aphia_ids=newly_resolved_aphia_ids,
         check_in=check_in,
         portrait=portrait,
-        claim_links=claim_links,
+        claim_connections=claim_connections,
         batch_dive_ids=batch_dive_ids,
         held=held,
-        gone_dives=gone_dives,
         minted=minted,
     )
     return await planner.plan()

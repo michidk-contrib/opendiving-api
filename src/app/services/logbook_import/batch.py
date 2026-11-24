@@ -563,7 +563,6 @@ async def import_batch(
     newly_resolved_aphia_ids: frozenset[int] = frozenset(),
     check_in: ImportCheckInSubmission | None = None,
     portrait: ImportPortraitChoice | None = None,
-    gone_dives: Mapping[str, frozenset[uuid_pkg.UUID]] | None = None,
     minted: Mapping[str, Mapping[str, Mapping[str, list[str]]]] | None = None,
     serialise_new: bool | None = None,
 ) -> BatchReport:
@@ -579,9 +578,9 @@ async def import_batch(
     the register could not answer for. `check_in` and `portrait` are what the diver confirmed in
     the review, handed to every file: a detail a file does not carry, or one already written,
     writes nothing, and only an archive carries a portrait. A writing pass - an apply, or an upload
-    applied at once - spends the limit on linking people as it links them; the upload's review
-    pass reads it. `gone_dives` and `minted` are the apply's, each by `file_key`: the document
-    dives to skip, and what the upload's pass minted. `serialise_new` says whether a `new` row
+    applied at once - spends the limit on connecting people as it connects them; the upload's review
+    pass reads it. `minted` is the apply's, by `file_key`: what the upload's pass minted.
+    `serialise_new` says whether a `new` row
     carries its dive: by default the upload's pass does and an apply's does not, its review
     already holding them.
     """
@@ -616,10 +615,9 @@ async def import_batch(
                 newly_resolved_aphia_ids=newly_resolved_aphia_ids,
                 check_in=check_in,
                 portrait=portrait,
-                claim_links=apply,
+                claim_connections=apply,
                 batch_dive_ids=frozenset(written_dives),
                 held=staged.held,
-                gone_dives=(gone_dives or {}).get(key, frozenset()),
                 minted=file_minted,
             )
             for match in plan.recording_matches:

@@ -50,11 +50,11 @@ from src.app.schemas.logbook_import import (
     LogbookImportStatus,
 )
 from src.app.services import blob_store
+from src.app.services import dive_files as dive_files_module
 from src.app.services.dive_merge import merge_dives
 from src.app.services.dive_recordings import DEVICE_COLUMNS
 from src.app.services.export.archive import DIVEJSON_NAME
 from src.app.services.logbook_import import import_batch, imports, load_import
-from src.app.services.logbook_import.planner import DELETED_HERE
 from src.app.services.logbook_import.reconcile import hold_reviewed_values
 from tests.conftest import db_available
 from tests.helpers.generators import (
@@ -73,7 +73,7 @@ from tests.test_logbook_import_batch import _logbook as _what_is_stored
 pytestmark = pytest.mark.skipif(not db_available(), reason="No database connection available")
 
 # The digest `_shape_digest` answers at `REVIEW_SHAPE`. It moves with the number, on purpose.
-EMBEDDED_SHAPE = "c4b5be17f02ae695503181814b33f1505ed095f854f8b6755f291b197c5e6a21"
+EMBEDDED_SHAPE = "609297a75f52c2d6aeea3d19c52d0bffe695a577fa2d18a08584c8145c248fff"
 
 FIXTURES = Path(__file__).parent / "fixtures" / "dive_files"
 OCEAN_FIT = (FIXTURES / "suunto-ocean-2026.fit").read_bytes()
@@ -443,7 +443,9 @@ class TestTheLog:
 
         LogbookImportNotes.model_validate(log)
         [row] = log["dives"]
-        assert (row["uuid"], row["outcome"], row["reason"]) == (pending["uuid"], "skipped", DELETED_HERE)
+        assert (row["outcome"], row["reason"]) == ("new", None)
+        assert row["uuid"] != pending["uuid"]
+        assert ImportNoteCode.REVIEW_UNSHOWN.value in {note["code"] for note in row["notes"]}
 
 
 class TestTheLifetimes:
@@ -948,12 +950,12 @@ class TestAppliedAsReviewed:
         ],
     )
     @pytest.mark.asyncio
-    async def test_a_dive_partly_on_a_gone_dive_goes_with_it_for_the_reason_it_did(
+    async def test_a_dive_partly_on_a_gone_dive_is_one_new_dive_holding_all_of_it(
         self, async_db: AsyncSession, db: Session, first_start: str
     ) -> None:
-        """One document dive, one recording on a stored dive and one of its own: the whole of it
-        is skipped when the stored dive goes, and the new row says why rather than that its file
-        could not be read."""
+        """One document dive, one recording on a stored dive and one of its own: once the stored
+        dive goes, the whole of it is one new dive, and the two rows the review showed are its
+        one row."""
         diver = create_user(db)
         stored = _recording("A1", first_start)
         await upload_and_apply(
@@ -968,15 +970,22 @@ class TestAppliedAsReviewed:
 
         applied = await apply(async_db, diver, review["uuid"])
 
-        assert [(row["outcome"], row["reason"]) for row in applied["dives"]] == [("skipped", DELETED_HERE)] * 2
-        live = select(func.count()).select_from(Dive).where(Dive.user_id == diver.id, Dive.is_deleted.is_(False))
-        assert await async_db.scalar(live) == 0
-        log = await _notes(async_db, diver, review["uuid"])
-        said = {note["code"] for row in log["dives"] for note in row["notes"]}
-        assert ImportNoteCode.REVIEW_OVERTAKEN.value not in said, "a skipped row reached no dive"
+        assert [(row["outcome"], row["reason"]) for row in applied["dives"]] == [("new", None)]
+        assert (await _rows(async_db, diver))[-1].counts == {"new": 1}
+        [live] = (
+            await async_db.execute(select(Dive.id).where(Dive.user_id == diver.id, Dive.is_deleted.is_(False)))
+        ).scalars()
+        recordings = select(func.count()).select_from(DiveRecording).where(DiveRecording.dive_id == live)
+        assert await async_db.scalar(recordings) == 2
+        [log] = (await _notes(async_db, diver, review["uuid"]))["dives"]
+        said = [note["code"] for note in log["notes"]]
+        assert said.count(ImportNoteCode.REVIEW_UNSHOWN.value) == 1
+        assert ImportNoteCode.REVIEW_OVERTAKEN.value not in said
 
     @pytest.mark.asyncio
-    async def test_a_gone_dive_two_files_reached_is_one_skipped_row(self, async_db: AsyncSession, db: Session) -> None:
+    async def test_a_gone_dive_two_files_reached_is_one_new_row(self, async_db: AsyncSession, db: Session) -> None:
+        """The dive was flagged deleted with its file left on it, as the admin panel leaves one:
+        the file is the new dive's, and the second file joins it."""
         diver = create_user(db)
         await upload_and_apply(async_db, diver, [("dive.fit", OCEAN_FIT)])
         review = await upload(async_db, diver, [("dive.fit", OCEAN_FIT), ("dive.json", OCEAN_JSON)])
@@ -986,9 +995,15 @@ class TestAppliedAsReviewed:
 
         applied = await apply(async_db, diver, review["uuid"])
 
-        assert [row["outcome"] for row in applied["dives"]] == ["skipped"]
-        assert (await _rows(async_db, diver))[-1].counts == {"skipped": 1}
+        assert [row["outcome"] for row in applied["dives"]] == ["new"]
+        assert (await _rows(async_db, diver))[-1].counts == {"new": 1}
         assert len((await _notes(async_db, diver, review["uuid"]))["dives"]) == 1
+        [live] = (
+            await async_db.execute(select(Dive.id).where(Dive.user_id == diver.id, Dive.is_deleted.is_(False)))
+        ).scalars()
+        held = select(func.count()).select_from(DiveFile).where(DiveFile.user_id == diver.id)
+        assert await async_db.scalar(held) == 2
+        assert await async_db.scalar(held.where(DiveFile.dive_id == live)) == 2
 
     @pytest.mark.asyncio
     async def test_a_recording_value_is_held_by_the_recording_s_uuid(self, async_db: AsyncSession, db: Session) -> None:
@@ -1014,57 +1029,137 @@ class TestAppliedAsReviewed:
 
     @pytest.mark.parametrize("second", ["dive.json", "dive.fit"], ids=["modified", "unchanged"])
     @pytest.mark.asyncio
-    async def test_a_reviewed_dive_deleted_since_is_skipped_and_not_brought_back(
+    async def test_a_reviewed_dive_deleted_since_is_a_new_dive(
         self, async_db: AsyncSession, db: Session, second: str
     ) -> None:
+        """Deleted through the api between the review and the Import: the file's dive is what any
+        import makes of it, a new dive, and its row reads that dive and says the review did not
+        show it."""
         diver = create_user(db)
         await upload_and_apply(async_db, diver, [("dive.fit", OCEAN_FIT)])
         review = await upload(async_db, diver, [(second, OCEAN_JSON if second == "dive.json" else OCEAN_FIT)])
         [reviewed] = review["dives"]
-        await async_db.execute(update(Dive).where(Dive.user_id == diver.id).values(is_deleted=True))
-        await async_db.commit()
+        gone = await async_db.scalar(select(Dive.id).where(Dive.user_id == diver.id))
+        assert gone is not None
+        await dive_files_module.delete_files_for_dive(db=async_db, dive_id=gone, commit=False)
+        await crud_dives.delete(db=async_db, uuid=uuid_pkg.UUID(reviewed["uuid"]))
 
         applied = await apply(async_db, diver, review["uuid"])
 
         [row] = applied["dives"]
-        assert (row["outcome"], row["reason"]) == ("skipped", DELETED_HERE)
-        assert (row["uuid"], row["dive"], row["changes"]) == (reviewed["uuid"], reviewed["dive"], [])
-        assert await async_db.scalar(select(func.count()).select_from(Dive).where(Dive.user_id == diver.id)) == 1
+        assert (row["outcome"], row["reason"], row["changes"]) == ("new", None, [])
+        assert row["uuid"] != reviewed["uuid"]
+        [live] = (
+            await async_db.execute(select(Dive.uuid).where(Dive.user_id == diver.id, Dive.is_deleted.is_(False)))
+        ).scalars()
+        assert row["uuid"] == str(live) == row["dive"]["uuid"]
         kept = await async_db.scalar(select(func.count()).select_from(DiveFile).where(DiveFile.user_id == diver.id))
-        assert kept == 1, "the second file is not stored on the deleted dive"
+        assert kept == 1, "the file is the new dive's"
+        [log] = (await _notes(async_db, diver, review["uuid"]))["dives"]
+        assert ImportNoteCode.REVIEW_UNSHOWN.value in {note["code"] for note in log["notes"]}
 
-    @pytest.mark.asyncio
-    async def test_a_reviewed_dive_merged_away_since_is_skipped_and_the_survivor_is_untouched(
-        self, async_db: AsyncSession, db: Session
-    ) -> None:
-        diver = create_user(db)
+    async def _merged_away_since(
+        self, async_db: AsyncSession, db: Session, diver: User, *, with_the_survivor: bool
+    ) -> tuple[dict[str, Any], Dive, int]:
+        """A reviewed dive, modified by the review's file, merged since into an earlier dive -
+        whose own row the review holds too where `with_the_survivor` says so."""
         await upload_and_apply(async_db, diver, [("dive.fit", OCEAN_FIT)])
         reviewed_dive = await async_db.scalar(select(Dive).where(Dive.user_id == diver.id))
         assert reviewed_dive is not None
-        reviewed_id = reviewed_dive.id
+        reviewed_id, reviewed_uuid = reviewed_dive.id, str(reviewed_dive.uuid)
         survivor = create_dive(db, diver)
         create_dive_recording(db, diver, survivor)
         earlier = {"start_time": reviewed_dive.start_time - timedelta(minutes=5), "utc_offset_minutes": 120}
         db.execute(update(Dive).where(Dive.id == survivor.id).values(**earlier))
         db.execute(update(DiveRecording).where(DiveRecording.dive_id == survivor.id).values(**earlier))
         db.commit()
-        review = await upload(async_db, diver, [("dive.json", OCEAN_JSON)])
-        assert review["dives"][0]["outcome"] == "modified"
+        files = [("dive.json", OCEAN_JSON)]
+        if with_the_survivor:
+            files.append(("survivor.divejson", _logbook({}, uuid=survivor.uuid)))
+        review = await upload(async_db, diver, files)
+        reviewed = {row["uuid"]: row["outcome"] for row in review["dives"]}
+        assert reviewed[reviewed_uuid] == "modified"
+        assert (str(survivor.uuid) in reviewed) is with_the_survivor
         first = await _internal(async_db, survivor.id)
         second = await _internal(async_db, reviewed_id)
         await merge_dives(async_db, first=first, second=second)
         await async_db.commit()
-        files_before = await async_db.scalar(
-            select(func.count()).select_from(DiveFile).where(DiveFile.user_id == diver.id)
-        )
+        return review, survivor, reviewed_id
+
+    @pytest.mark.parametrize("with_the_survivor", [False, True], ids=["alone", "beside the survivor's row"])
+    @pytest.mark.asyncio
+    async def test_a_reviewed_dive_merged_away_since_goes_to_the_merged_dive(
+        self, async_db: AsyncSession, db: Session, with_the_survivor: bool
+    ) -> None:
+        """Its file goes where any import takes it, to the dive it was merged into, and the dive
+        has one row: the survivor's, holding the files of both rows the review showed."""
+        diver = create_user(db)
+        review, survivor, _ = await self._merged_away_since(async_db, db, diver, with_the_survivor=with_the_survivor)
 
         applied = await apply(async_db, diver, review["uuid"])
 
-        assert (applied["dives"][0]["outcome"], applied["dives"][0]["reason"]) == ("skipped", DELETED_HERE)
-        files_after = await async_db.scalar(
-            select(func.count()).select_from(DiveFile).where(DiveFile.user_id == diver.id)
+        [row] = applied["dives"]
+        assert row["uuid"] == str(survivor.uuid)
+        assert row["outcome"] in {"modified", "unchanged"}
+        assert sorted(row["members"]) == list(range(len(review["members"])))
+        assert (await _rows(async_db, diver))[-1].counts == {row["outcome"]: 1}
+        [log] = (await _notes(async_db, diver, review["uuid"]))["dives"]
+        assert [note["code"] for note in log["notes"]].count(ImportNoteCode.REVIEW_UNSHOWN.value) == 1
+        live = select(func.count()).select_from(Dive).where(Dive.user_id == diver.id, Dive.is_deleted.is_(False))
+        assert await async_db.scalar(live) == 1
+        json_digest = hashlib.sha256(OCEAN_JSON).hexdigest()
+        on = await async_db.scalar(
+            select(DiveFile.dive_id).where(DiveFile.user_id == diver.id, DiveFile.sha256 == json_digest)
         )
-        assert files_after == files_before
+        assert on == survivor.id
+
+    @pytest.mark.asyncio
+    async def test_a_reviewed_value_is_never_written_to_a_dive_the_review_did_not_show(
+        self, async_db: AsyncSession, db: Session
+    ) -> None:
+        """The review held the merged-away dive's values; the survivor is not held to them."""
+        diver = create_user(db)
+        review, survivor, _ = await self._merged_away_since(async_db, db, diver, with_the_survivor=False)
+        [reviewed] = review["dives"]
+        await async_db.execute(update(Dive).where(Dive.id == survivor.id).values(notes="the survivor's own"))
+        await async_db.commit()
+        held: list[Any] = []
+        real = imports.hold_reviewed_values
+
+        async def spy(*args: Any, **kwargs: Any) -> Any:
+            held.append(kwargs)
+            return await real(*args, **kwargs)
+
+        imports.hold_reviewed_values = spy  # type: ignore[assignment]
+        try:
+            await apply(async_db, diver, review["uuid"])
+        finally:
+            imports.hold_reviewed_values = real  # type: ignore[assignment]
+
+        assert held == [], "no row was held to the review"
+        notes = await async_db.scalar(
+            select(Dive.notes).where(Dive.id == survivor.id).execution_options(populate_existing=True)
+        )
+        assert notes == "the survivor's own"
+        assert reviewed["changes"], "the review had values to hold"
+
+    @pytest.mark.asyncio
+    async def test_a_gone_dive_s_row_whose_file_can_no_longer_be_read_is_skipped_saying_so(
+        self, async_db: AsyncSession, db: Session
+    ) -> None:
+        diver = create_user(db)
+        await upload_and_apply(async_db, diver, [("dive.fit", OCEAN_FIT)])
+        review = await upload(async_db, diver, [("dive.json", OCEAN_JSON), ("other.divejson", _logbook({}))])
+        reviewed = next(row["uuid"] for row in review["dives"] if row["outcome"] == "modified")
+        await async_db.execute(update(Dive).where(Dive.user_id == diver.id).values(is_deleted=True))
+        await async_db.commit()
+        [held] = [file for file in await _files(async_db, diver) if file.filename == "dive.json"]
+        await blob_store.put(held.storage_key, UNREADABLE)
+
+        applied = await apply(async_db, diver, review["uuid"])
+
+        row = next(row for row in applied["dives"] if row["uuid"] == reviewed)
+        assert (row["outcome"], row["reason"]) == ("skipped", imports._UNREAD_SINCE)
 
     @pytest.mark.asyncio
     async def test_a_record_another_account_holds_is_written_at_the_uuid_the_review_showed(
@@ -1141,7 +1236,7 @@ class TestAppliedAsReviewed:
         by_uuid = {row["uuid"]: row for row in applied["dives"]}
         assert [row["uuid"] for row in applied["dives"]] == [row["uuid"] for row in review["dives"]]
         doomed_row = by_uuid[json.loads(doomed)["dives"][0]["uuid"]]
-        assert doomed_row["outcome"] == "skipped"
+        assert doomed_row["outcome"] == "new", "a dive deleted since is a new dive under its uuid"
         written = await async_db.scalars(select(Dive.uuid).where(Dive.user_id == diver.id, Dive.is_deleted.is_(False)))
         assert {str(uuid) for uuid in written.all()} == {
             row["uuid"] for row in applied["dives"] if row["outcome"] == "new"
@@ -1201,7 +1296,7 @@ class TestTheShapeOfWhatIsStored:
         """A review is served as it was stored, so a change to a schema it embeds reaches rows no
         deploy rewrites. If this fails, bump `REVIEW_SHAPE`, make the call on the stored rows -
         migrate them or retire them - and only then write the new digest and number here."""
-        assert (REVIEW_SHAPE, _shape_digest()) == (2, EMBEDDED_SHAPE)
+        assert (REVIEW_SHAPE, _shape_digest()) == (3, EMBEDDED_SHAPE)
 
     def test_a_change_of_wording_moves_nothing(self) -> None:
         first = _without_docs({"title": "A", "description": "x", "examples": [1], "properties": {"title": {}}})
@@ -1376,9 +1471,31 @@ class TestAppliedAtOnce:
         import_routes.invalidate_dive_caches.assert_awaited_once_with(diver.id)  # type: ignore[attr-defined]
         import_routes.invalidate_trip_caches.assert_awaited_once_with(diver.id)  # type: ignore[attr-defined]
 
+    @pytest.mark.asyncio
+    async def test_it_spends_its_own_budget_and_no_other(
+        self, async_db: AsyncSession, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        diver = create_user(db)
+        spent: list[tuple[Any, ...]] = []
+
+        async def limit(*args: Any) -> None:
+            spent.append(args)
+
+        monkeypatch.setattr(import_routes, "enforce_rate_limit", limit)
+
+        await apply_at_once(async_db, diver, [("dive.fit", OCEAN_FIT)])
+
+        assert spent == [
+            (
+                f"import-at-once:user:{diver.id}",
+                settings.IMPORT_AT_ONCE_RATE_LIMIT_PER_USER,
+                settings.IMPORT_RATE_LIMIT_WINDOW_SECONDS,
+            )
+        ]
+
     @pytest.mark.parametrize("spent", ["import", "import-apply"])
     @pytest.mark.asyncio
-    async def test_either_budget_spent_is_a_429_before_the_body(
+    async def test_the_other_budgets_spent_leave_it_through(
         self, async_db: AsyncSession, db: Session, monkeypatch: pytest.MonkeyPatch, spent: str
     ) -> None:
         diver = create_user(db)
@@ -1388,28 +1505,46 @@ class TestAppliedAtOnce:
                 raise RateLimitException("Too many")
 
         monkeypatch.setattr(import_routes, "enforce_rate_limit", limit)
-        read = AsyncMock()
+
+        applied = await apply_at_once(async_db, diver, [("dive.fit", OCEAN_FIT)])
+
+        assert [row["outcome"] for row in applied["dives"]] == ["new"]
+
+    @pytest.mark.asyncio
+    async def test_its_budget_spent_is_a_429_before_the_body_and_refuses_nothing_else(
+        self, async_db: AsyncSession, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        diver = create_user(db)
+
+        async def limit(key: str, *args: Any) -> None:
+            if key.startswith("import-at-once:user:"):
+                raise RateLimitException("Too many")
+
+        monkeypatch.setattr(import_routes, "enforce_rate_limit", limit)
+        read = AsyncMock(side_effect=import_routes.read_import_request)
         monkeypatch.setattr(import_routes, "read_import_request", read)
 
         assert (await _refusal(apply_at_once(async_db, diver, [("dive.fit", OCEAN_FIT)]))).status_code == 429
         read.assert_not_awaited()
         assert await _rows(async_db, diver) == []
 
+        review = await upload(async_db, diver, [("dive.fit", OCEAN_FIT)])
+        applied = await apply(async_db, diver, review["uuid"])
+
+        assert [row["outcome"] for row in applied["dives"]] == ["new"]
+
     @pytest.mark.asyncio
-    async def test_it_spends_one_from_each_budget(
+    async def test_a_repeat_under_its_key_spends_nothing(
         self, async_db: AsyncSession, db: Session, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         diver = create_user(db)
-        spent: list[str] = []
-
-        async def limit(key: str, *args: Any) -> None:
-            spent.append(key)
-
+        await apply_at_once(async_db, diver, [("dive.fit", OCEAN_FIT)], key="walk-1")
+        limit = AsyncMock()
         monkeypatch.setattr(import_routes, "enforce_rate_limit", limit)
 
-        await apply_at_once(async_db, diver, [("dive.fit", OCEAN_FIT)])
+        await apply_at_once(async_db, diver, [("dive.fit", OCEAN_FIT)], key="walk-1")
 
-        assert sorted(spent) == [f"import-apply:user:{diver.id}", f"import:user:{diver.id}"]
+        limit.assert_not_awaited()
 
 
 class TestAppliedAtOnceUnderAKey:

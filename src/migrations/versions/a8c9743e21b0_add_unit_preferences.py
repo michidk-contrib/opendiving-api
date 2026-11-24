@@ -1,7 +1,7 @@
 """Add independent unit preferences, preserving every account's existing preset
 
 Revision ID: a8c9743e21b0
-Revises: 800c913889b4
+Revises: 438bcf2e2865
 Create Date: 2026-11-12 08:10:00.000000
 """
 
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "a8c9743e21b0"
-down_revision: str | None = "800c913889b4"
+down_revision: str | None = "438bcf2e2865"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
