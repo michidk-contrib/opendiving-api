@@ -103,9 +103,10 @@ else; what is here is the source, and the notes for working on it.
   service or a trip part. Imported from UDDF's dive bases, shops and accommodation.
 - **People** — the buddies, guides, instructors, fellow students and companions you were with, each
   kept once and listed with a role on a dive, a trip or a course; a course's and a card's instructor
-  is one. A person can be linked to an account on the same instance by its exact username, which
-  shows you that account's current username and tells it nothing. Imported from UDDF buddies and
-  guides and Subsurface's buddy and divemaster fields.
+  is one. A person can be connected to an account on the same instance through that account's
+  connect link, which shows you its picture and current username and shows it your name, username
+  and picture under its *Added you*, where it can add you back, hide you or disconnect you. Imported
+  from UDDF buddies and guides and Subsurface's buddy and divemaster fields.
 - **Full export** — everything out in open formats (DiveJSON, UDDF, CSV, and an archive of all three
   plus your dive drafts and your original files) in one request. Owner-only, never cached; the
   DiveJSON validates against the published 1.0 schema and the UDDF against the 3.2.2 one.
@@ -252,32 +253,33 @@ records; **certifications** with their card images and the **courses** that issu
 in DiveJSON, UDDF, CSV or full-archive form and **import** back from either of the first and the
 last, or from any format the converter reads; **invitations**, which exist only where the operator
 has closed registration (`REGISTRATION_MODE`, documented with the rest of the settings in
-`src/.env.example`) — a member sends and revokes their own, makes, resets and removes their invite
-link, and the routes answer 404 on an open instance; and **admin**, the operator's own — the queue
-of people who have asked to be let in, inviting or removing them in a batch, the daily totals of
-accounts created, sign-ins and active accounts, the requests the instance sent to other services,
-counted per day, and the species catalog with its photos to hide, pin or re-fetch and its photo
-proposals to accept or decline — which is the one family gated on `is_superuser` rather than merely
-on having a token. All of those want a bearer token: a browser's access token, or for a tool of your
-own an **API key** — created in Settings, `read` or `write`, lasting thirty days, ninety, a year or
-until revoked, and sent on the same `Authorization: Bearer` header. A key is refused on the routes
-that manage credentials, the sign-in address or the account itself, and a `read` key on anything but
-a safe method; `docs/authentication.md` has the rest. The ones that don't are **support**, the auth
-routes themselves, the two health checks — `/health` says the process is up, `/health/ready` says
-Postgres and Redis answered, and 503s when they didn't — `POST /invite-requests`, which is how
-somebody with no account asks a closed instance for an invitation, `GET /config`, which tells the
-web app whether registration is open - whether the project itself operates the instance, whether any
-join link exists (`join_links`), whether a map renderer draws the map tiles (`map_tiles`) and the
-credit they owe (`map_attribution`), and which experimental features the instance switches on
-(`experimental_features`) - before anyone has signed in, `GET /join-channel/{slug}`, which says
-whether one join link is live, `GET /invite-link/{token}`, which says whose invite link one token
-is, `GET /species/{uuid}/photo`, which serves a public Commons image to an `<img>` tag that has no
-way to send a token, and `GET /checkin/{token}` with its `/portrait` and
-`/certification/{uuid}/front`, the check-in page a diver shared as a link, where the token in the
-path is the credential, and `GET /openapi.json`, the document itself.
-`tests/test_route_authentication.py` is the guard that keeps the *anonymous* half of that list
-honest — it compares the app's real route table against its own allowlist and holds the reason for
-each — but nothing checks this paragraph, so a new route family belongs here by hand.
+`src/.env.example`) — somebody with no account asks for one, and the route answers 404 on an open
+instance; the **connect link** a member makes, resets and removes, in every mode; and **admin**, the
+operator's own — the queue of people who have asked to be let in, inviting or removing them in a
+batch, the daily totals of accounts created, sign-ins and active accounts, the requests the instance
+sent to other services, counted per day, and the species catalog with its photos to hide, pin or
+re-fetch and its photo proposals to accept or decline — which is the one family gated on
+`is_superuser` rather than merely on having a token. All of those want a bearer token: a browser's
+access token, or for a tool of your own an **API key** — created in Settings, `read` or `write`,
+lasting thirty days, ninety, a year or until revoked, and sent on the same `Authorization: Bearer`
+header. A key is refused on the routes that manage credentials, the sign-in address or the account
+itself, and a `read` key on anything but a safe method; `docs/authentication.md` has the rest. The
+ones that don't are **support**, the auth routes themselves, the two health checks — `/health` says
+the process is up, `/health/ready` says Postgres and Redis answered, and 503s when they didn't —
+`POST /invite-requests`, which is how somebody with no account asks a closed instance for an
+invitation, `GET /config`, which tells the web app whether registration is open - whether the
+project itself operates the instance, whether any join link exists (`join_links`), whether a map
+renderer draws the map tiles (`map_tiles`) and the credit they owe (`map_attribution`), and which
+experimental features the instance switches on (`experimental_features`) - before anyone has signed
+in, `GET /join-channel/{slug}`, which says whether one join link is live,
+`GET /connect-link/{token}` with its `/avatar`, which say whose connect link one token is,
+`GET /species/{uuid}/photo`, which serves a public Commons image to an `<img>` tag that has no way
+to send a token, and `GET /checkin/{token}` with its `/portrait` and `/certification/{uuid}/front`,
+the check-in page a diver shared as a link, where the token in the path is the credential, and
+`GET /openapi.json`, the document itself. `tests/test_route_authentication.py` is the guard that
+keeps the *anonymous* half of that list honest — it compares the app's real route table against its
+own allowlist and holds the reason for each — but nothing checks this paragraph, so a new route
+family belongs here by hand.
 
 A record's create — `POST /dive`, `/trip`, `/person` and the like; `/docs` lists the header on each
 — takes an optional `Idempotency-Key` header: a repeat under the same key answers the record the

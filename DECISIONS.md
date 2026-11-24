@@ -411,9 +411,12 @@ non-deleted row. "My account" and "someone else's public profile" are distinct, 
 endpoints — full data including `email` from the token versus a limited public subset keyed by
 `{uuid}` — rather than one `/user/{uuid}` route gated by a runtime `if current_user["uuid"] != uuid`
 check a new route can forget. There is no `GET /user/{uuid}`, no `GET /users` and no `read_users`.
-Another user's data reaches a caller only as a check-in link's card for its token holder, and as the
-account a diver linked a person to: its current username, and its public id in the diver's own
-export. Public dive stats would be `GET /profile/{uuid}/dive-stats`.
+Another user's data reaches a caller only as a check-in link's card for its token holder; as a
+connect link's owner, by name and picture to its token holder and by username besides to one with a
+session; as the account a diver's person is connected to, by its current username and picture and by
+its public id in the diver's own export; and as the rows under *Added you*, the name, username and
+picture of each account that has the caller in its people. Public dive stats would be
+`GET /profile/{uuid}/dive-stats`.
 
 ## `CORSMiddleware` is gated on `FrontendSettings`; without it every preflight is a 405
 
@@ -1414,9 +1417,10 @@ lifetime number (UDDF, Subsurface's XML) populates it.
 
 ## `GET /dive/{uuid}/neighbors` is two one-row queries, ordered by `(start_time, id)`
 
-Returns the two dives either side — `uuid`, `dive_number`, `start_time` — not a `DiveRead` per side
-(which costs `_cached_read_dives`' lookups), since after a deep link the client holds no list.
-`next` means later in time, the opposite end of the newest-first `GET /dives` list.
+Returns the two dives either side — `uuid`, `dive_number`, `start_time`, `max_depth`,
+`submerged_time` — not a `DiveRead` per side (which costs `_cached_read_dives`' lookups), since
+after a deep link the client holds no list. `next` means later in time, the opposite end of the
+newest-first `GET /dives` list.
 
 Ordering is `(start_time, id)` as a row comparison: on `start_time` alone a strict `<`/`>` skips a
 tied dive and `<=`/`>=` returns the dive itself.
@@ -4229,8 +4233,8 @@ already collapses both to `valid=false`.
 ## Every foreign key into `user.id` declares `ondelete="CASCADE"` but two
 
 Every foreign key into `user.id` declares `ondelete="CASCADE"` but two, which are `SET NULL`.
-`person.linked_user_id` names *another* account, whose purge must unlink this diver's person rather
-than delete it. `dive_site_history.reviewer_id` names the reviewer who accepted a change to a
+`person.connected_user_id` names *another* account, whose purge must disconnect this diver's person
+rather than delete it. `dive_site_history.reviewer_id` names the reviewer who accepted a change to a
 Commons record, whose purge must leave the entry naming nobody rather than delete it. `DELETE /user`
 soft-deletes (`SoftDeleteMixin`); the raw `DELETE FROM "user"` is the purge's. Two traps in a
 revision that changes one: autogenerate and `alembic check` do not detect an `ondelete` change, so
@@ -5282,7 +5286,7 @@ exposes these.
 ## Auth audit: Membership is a rule, and the exclusions are half of it
 
 A site emits an event when it (a) commits a row to an auth table, (b) mints a session, onboarding,
-restore or invite-link token or an API key, (c) revokes a credential at its owner's request, (d)
+restore or connect-link token or an API key, (c) revokes a credential at its owner's request, (d)
 ends, revokes or detects the replay of a session at the caller's request, or (e) logs a `WARNING`
 for a failure the code deems rare and meaningful — its own criterion, and how the passkey counter
 regression qualifies.
@@ -5571,20 +5575,20 @@ qualifier: disclosure timing does not turn on who runs the instance. Test: does 
 
 ## An invitation is an allow-list entry, not a bearer token
 
-A typed `invitation` carries no secret; the invitee is admitted because they signed in with the
-invited address. Rejected: a shareable redeemable code (Mastodon, Lemmy, Mealie, Bluesky PDS).
-Sign-in already proves ownership of the address via magic link, code or Google's `email_verified`,
-so a token would add a redemption surface through `/auth/verify` and `/onboarding` while proving
-nothing new; Plausible and Ghost bind the same way. Losing forwardability is the feature: a closed
-beta keyed on addresses keeps "who was invited" coupled to "who signed up". No per-invitation
-expiry; the 90-day retention sweep bounds the address. Revocation stamps `revoked_at` rather than
-deleting, so the quota stays a bound on invitations made. The one forwardable kind is a member's
-invite link, below, which a sign-up through records here as an accepted row.
+The operator's `invitation` (`POST /admin/invitations`) carries no secret; the invitee is admitted
+because they signed in with the invited address. Rejected: a shareable redeemable code (Mastodon,
+Lemmy, Mealie, Bluesky PDS). Sign-in already proves ownership of the address via magic link, code or
+Google's `email_verified`, so a token would add a redemption surface through `/auth/verify` and
+`/onboarding` while proving nothing new; Plausible and Ghost bind the same way. Losing
+forwardability is the feature: a closed beta keyed on addresses keeps "who was invited" coupled to
+"who signed up". No per-invitation expiry; the 90-day retention sweep bounds the address, and a row
+carrying `revoked_at` admits nobody. The one forwardable kind is a member's connect link, below,
+which a sign-up through records here as an accepted row.
 
-## A check-in link is a bearer token, where a typed invitation is not
+## A check-in link is a bearer token, where an invitation by address is not
 
 `POST /user/checkin-link` mints a secret that shows the diver's check-in page to whoever holds it.
-The typed invitation rejected a forwardable secret because forwarding was what it had to prevent;
+An invitation by address rejects a forwardable secret because forwarding is what it has to prevent;
 here forwarding to a desk is the feature. What bounds it instead: only `hash_token` of it is stored,
 it is returned once, it lives `CHECKIN_LINK_TTL` (24 hours), minting revokes the diver's other links
 under a lock on their row, and a deletion request kills it at once. Unknown, expired, revoked and
@@ -5592,13 +5596,13 @@ deleted-diver tokens get one 404, carrying `private, no-store` like every respon
 limit: the token has 256 bits. *Rejected:* a week's life, and redacting the policy number and the
 emergency contact's phone, the two things a desk asks for.
 
-## An invite link is a bearer token stored in clear, where a check-in link is hashed
+## A connect link is a bearer token stored in clear, where a check-in link is hashed
 
-`invite_link.token` is kept readable because the Invitations card shows the same link and QR code on
-every visit, and a hash cannot be shown again. What the token admits is bounded instead: a stranger
-to an invite-only instance, counted as the member's invitation and charged to their quota, until the
-member's Reset replaces it in place or Remove deletes it. Anyone who can read the table can already
-read every member's address, which is worse. 128 bits from `secrets.token_hex(16)`, so it fits
+`connect_link.token` is kept readable because People shows the same link and QR code on every visit,
+and a hash cannot be shown again. Its holder sees the member's name and picture, may connect to the
+member, and on an invite-only instance may create an account charged to the member's quota; on an
+open instance anyone may register anyway, so it adds the tie alone, which Disconnect cuts. Reset
+replaces the token in place and Remove deletes it. 128 bits from `secrets.token_hex(16)`, so it fits
 `via`'s slug pattern and column. *Rejected:* hash-at-rest with show-once, right for a link that
 lives a day and wrong for a standing one; a token derived by HMAC from the account and `SECRET_KEY`,
 which ties every link to a key a self-hoster may rotate.
@@ -5650,44 +5654,38 @@ after the address is proven.
 
 ## The invitation quota is counted from the table, not from the rate limiter
 
-`INVITATIONS_PER_USER` per `INVITATIONS_WINDOW_DAYS` (5 per 1 day) counts `invitation` rows the
-inviter created in the trailing window, revoked and accepted included; Redis is not consulted. The
-rate limiter fails open on a Redis outage and its counters are flushed locally — right for pacing a
-sign-in form, wrong for a bound on who enters a closed instance. Revoked rows count so the quota
-bounds invitations made rather than live ones; a revoke cannot refill the bucket. A sign-up through
-the member's invite link writes an accepted row, so it draws on the same allowance. A rate rather
-than a lifetime allotment (Lemmy's `max_invites_per_user_allowed` shape rejected): five today, five
-more tomorrow. Superusers are exempt structurally — the count is never taken for them.
+`INVITATIONS_PER_USER` per `INVITATIONS_WINDOW_DAYS` (5 per 1 day) bounds how many accounts a
+member's connect link admits to an invite-only instance. It counts the `invitation` rows the member
+holds from the trailing window, whatever their stamps, and each sign-up through the link writes an
+accepted one; Redis is not consulted. The rate limiter fails open on a Redis outage and its counters
+are flushed locally — right for pacing a sign-in form, wrong for a bound on who enters a closed
+instance. A rate rather than a lifetime allotment (Lemmy's `max_invites_per_user_allowed` shape
+rejected): five today, five more tomorrow. Superusers are exempt structurally — the count is never
+taken for them.
 
-## Inviting an address that already has an account is a 409, and that is a disclosure
+## The operator's batch says which addresses already have an account
 
-`POST /user/invitations` answers `409 That address already has an account on this instance.`,
-telling a signed-in caller that an address is registered. Accepted: a `201` that creates nothing
-leaves the inviter hunting for a missing row and reveals the same fact a moment later; Plausible and
-Ghost surface it openly. The quota does not bound this — it counts `invitation` rows via
-`invitations_created_since`, and the 409 returns before anything is created, so a probe is free and
-a 409 stays distinguishable from a 429. So the route carries
-`INVITATION_ATTEMPT_RATE_LIMIT_PER_USER` (20 per magic-link window), applied above the existence
-check, to superusers too, larger than the quota so a mistyped address does not spend a real
-invitation. Same shape as `PATCH /user`'s username check, keyed per user. Rule: an availability
-check that answers distinguishably needs its own throttle; a quota counted from successful writes is
-not one. The comparison is case-insensitive.
+`POST /admin/invitations` reports `already_registered` for an address with an account, and creates
+nothing for it. That discloses nothing: only a superuser reaches the route, and the operator can
+read every account anyway, so no throttle applies. The comparison is case-insensitive. Rule: an
+availability check that answers an ordinary account distinguishably needs a throttle of its own, as
+`PATCH /user`'s username check has; a quota counted from successful writes never charges for a
+refusal, so it is not one.
 
 ## Every account lookup by address is on `lower(User.email)`
 
 `POST /auth/complete` inserts `token_data.email` verbatim and the Google path hands
 `resolve_identity` its `email` claim un-lowercased, so `User.email` may carry capitals; both
 invitation tables store lowercase. The narrow fix is chosen: compare on `lower(User.email)` wherever
-an invitation address meets an account — the `409` on `POST /user/invitations`, `has_account` on
-`GET /admin/invite-requests`, the skip arm of `POST /admin/invitations` — all through
-`crud.crud_invitations.account_exists_for`; `POST /auth/complete`'s delete of a pending request for
-the new account's address; and the revision backfilling `daily_total`, which matches accepted
-invitations to accounts. Sign-in compares the same way, through `crud.crud_users.account_for_email`
-and `account_exists_for`. Rejected: normalising `User.email` on write, which touches the account
-path, the email-change path and every row. `_purge_one_account` is the mirror image: its
-`authentication_request` and `auth_audit_event` deletes compare the stored email raw because those
-tables hold what sign-in wrote, while the two invitation deletes lowercase first; the difference is
-commented at the call site.
+an invitation address meets an account — `has_account` on `GET /admin/invite-requests`, the skip arm
+of `POST /admin/invitations` — all through `crud.crud_invitations.account_exists_for`;
+`POST /auth/complete`'s delete of a pending request for the new account's address; and the revision
+backfilling `daily_total`, which matches accepted invitations to accounts. Sign-in compares the same
+way, through `crud.crud_users.account_for_email` and `account_exists_for`. Rejected: normalising
+`User.email` on write, which touches the account path, the email-change path and every row.
+`_purge_one_account` is the mirror image: its `authentication_request` and `auth_audit_event`
+deletes compare the stored email raw because those tables hold what sign-in wrote, while the two
+invitation deletes lowercase first; the difference is commented at the call site.
 
 ## `invite_request.created_at` needs a `server_default`, unlike every other one in this app
 
@@ -5757,8 +5755,8 @@ slot; rejected: `variouspieces` for both (loses the grouping) or splitting by ph
 `<buoyancycontroldevice>`, which names the broader kind. Each collapse costs only the sub-category:
 this app's own import reads the kit list under `<diver><owner><equipment>` through the `divejson`
 package's reader, which brings a line cutter or shears back as `knife` and a wing as `bcd`.
-`rebreather` and `scooter` are their own elements; `transmitter` and `backplate` have none and go to
-`<variouspieces>`.
+`rebreather` and `scooter` are their own elements; `transmitter`, `backplate`, `undergarment`,
+`tech_shorts` and `slate` have none and go to `<variouspieces>`.
 
 ## There is no `Course.cost`, and money is a cross-cutting concern this app has not designed yet
 
@@ -5853,11 +5851,11 @@ Rejected: an importer-local restatement of §3, which drifts.
 Spec §9's duplicate-member rule is a parsing rule — `json` keeps the last value — so
 `parse_document` and `DuplicateMemberError` in `services/logbook_import/reader.py` reject it.
 
-## A uuid is preserved, matched, skipped or remapped, and which one is a property of the instance
+## A uuid is preserved, matched, created again or remapped, and which one is a property of the instance
 
-Every caller-owned collection takes one of four branches on a document uuid. Unclaimed here: create
-under that uuid, preserving identity across instances. The caller's, live: nothing is written,
-counted as `linked` — the idempotence invariant. The caller's, soft-deleted: skip (next section).
+Every caller-owned collection takes one of four branches on a document uuid. Unclaimed: create under
+that uuid, preserving identity across instances. The caller's, live: nothing is written, counted as
+`linked` — the idempotence invariant. The caller's, soft-deleted: as unclaimed (next section).
 Another account's: mint a fresh uuid, create under it, remap every reference.
 
 A fifth remap — two records of one collection claiming one uuid — is decided in
@@ -5871,18 +5869,18 @@ source-uuid provenance column, a schema-wide change for one corner case.
 
 `species` is exempt: it belongs to nobody, and import never creates or claims a catalog row.
 
-## A record the caller deleted is never brought back by an import
+## To an import a deleted record does not exist
 
 A document record whose uuid is the caller's soft-deleted row (`Dive`, `Certification`,
-`GearServiceRecord`) is skipped with a note. A deleted dive's recordings still go through the
-recording gates, so a re-download of a dive the diver deleted and logged again from another source
-fills that dive. Rejected: restoring the row, and creating it under a fresh uuid, which is the same
-restore. Dives have no un-delete path; a trash bin would be its own feature.
+`GearServiceRecord`) is created as though the row were not there: the writer gives the row a uuid
+nothing holds, in the same transaction, and it stays deleted. Bytes only a deleted dive holds, as
+the admin panel's delete leaves them, move onto the recording that brings them. Rejected: skipping
+it, under which a deleted dive is never imported again; giving the uuid up at deletion, which owes a
+revision over every deleted row; a fresh uuid, under which a dive with no recording imported twice
+is two dives.
 
 The dedupe lookup branches on `is_deleted` rather than filtering it: an `is_deleted=False` query
-would call the husk's uuid unclaimed and hit the full `uuid` index. A dive the review showed that is
-deleted or merged away before the apply is skipped by its document dives, ahead of the gates: those
-read live dives alone, so a file's dive would otherwise be created again, or fill the survivor.
+would call the husk's uuid unclaimed and hit the full `uuid` index.
 
 ## No uniqueness rule anywhere fails an import
 
@@ -6106,8 +6104,11 @@ and `MAX_ARCHIVE_ENTRIES`, as `zipfile` builds an object per entry.
 is a 422 naming the password case; a failing blob member reads as `None`.
 
 The upload and the apply each rate-limit per user on a budget of ten, apart, so one import is one
-call against each and a refused apply cannot repeat its pass freely. An import's reads are not
-limited.
+call against each and a refused apply cannot repeat its pass freely. An upload applied at once
+spends neither, only `IMPORT_AT_ONCE_RATE_LIMIT_PER_USER`, 240 an hour by default: a phone sends one
+per batch of a download, at most one every 30 seconds, and a download spending the web's budgets
+would refuse the diver's next import there. It counts requests, not dives, since counting dives
+reads the archive before it can refuse. An import's reads are not limited.
 
 ## Logbook import reads whatever the converter reads, and the routes are `/imports`
 
@@ -6358,8 +6359,8 @@ recording `POST /dives/merge` produced: it spans both halves of an interrupted d
 half's start, and a file of that half alone would fill it. A merge is known by its `merge` profile
 or, where a re-derivation replaced that, by a kept file starting outside the tolerance
 (`holds_another_start`), the files being read only for a pair resting on the serial. Neither half
-then matches, and the merge action folds them again. Rejected: matching a file whose start falls
-inside a merged span.
+then matches; an import places such a record on the merge before either gate is asked (*A merge is
+not a deletion*).
 
 ## Of two profiles of one recording, the richer is kept
 
@@ -6442,6 +6443,17 @@ keeping `usage` and filling the survivor's blank cylinder members from the absor
 as an arrival does, an empty absorbed row not appended; moved profiles use
 `replace_profile_samples`, never `store_profile`. Join rows re-point, collisions stay, notes append
 within `NOTES_MAX_LENGTH`. `rederive_recording` and `delete_recording` are not reused.
+
+## A merge is not a deletion
+
+`POST /dives/merge` writes `merged_into_id` on the dive it soft-deletes, which keeps its uuid; every
+read still finds it deleted. An import and `POST /dive-computers/known-dives` resolve that uuid
+through merges to the dive it joined (`merged_dives.py`). An import asks `merge_holding` before the
+same-recording gate: a record of the same computer whose start `holds_listed_start` places inside a
+merge's recording belongs to it, filling nothing and adding, unread, only files the account lacks. A
+recording no gate places whose file a live dive holds belongs there too, which finds merges made
+before the column. Rejected: marking those by when the loser was deleted, which a duplicate deleted
+by hand also satisfies; a table of former uuids, which no index holds apart from the dives' own.
 
 ## `PlannedRecordingMatch` carries an ordinal, because a fill can land on a secondary recording
 
@@ -7059,17 +7071,17 @@ trip family's single reads are keyed under the user like its list, so one per-us
 trips whose parts named the contact. A rename reaches no host's cache: reads carry the uuid, never a
 summary.
 
-## Linking a person confirms an account exists, and nothing else
+## A connection shows each side the other, and only consent or an import makes one
 
-`POST`/`PATCH /person` link a person to the account with exactly that username and store the
-account, so the link survives a rename and a purge clears it. It answers *found* for exactly what
-the availability check calls taken, a deleted account in its grace period included, so comparing the
-two reveals nothing new; it is throttled like choosing a username
-(`PERSON_LINK_RATE_LIMIT_PER_USER`), counting only a change. The linker then sees that account's
-current username, and their own export carries its public id, a uuid7 that dates its creation -
-which that account's export carries anyway. An import links a person by that id, under the same
-limit, and reports the current username, which the file did not carry. *Rejected:* linking by email,
-a second oracle over guessable addresses.
+A person write makes a tie (`person.connected_user_id`) only from what the account handed over: its
+live connect link, or its own tie to the caller, which is adding back. Neither answers a guess - 128
+bits, and an id needs the other side's tie - so nothing throttles them. Reads join the account's
+username and picture live, so a rename, a new picture or a deletion request shows at once. An import
+connects by public id, which travels in every export naming the account, so it can make a tie nobody
+offered: it is throttled (`PERSON_CONNECT_RATE_LIMIT_PER_USER`) and reported, the account sees the
+importer under *Added you*, and its Disconnect is kept (`account_disconnect`) so a later import does
+not connect again, the importer reading an unknown id's note. *Rejected:* connecting by username,
+which showed a face nobody offered.
 
 ## Dive-computer files are stored as zstd frames, and the key says so
 
@@ -7129,6 +7141,18 @@ does. Rejected: the first file's reader, under which a mixed recording never goe
 other. `divejson-raw` is a subprocess with no environment, a timeout and an address-space ceiling,
 because libdivecomputer's parsers trust their input and an archive may name any of them. A
 `fitdecode` bump moves no version: `--force --parser-key fit`.
+
+## A phone original stored unlabelled is labelled from its recording's model
+
+Until 2026-11-04 the iOS app uploaded its `.bin` untagged, stored under `divejson_import`. Revision
+`36f9496a7b33` labels each once: a `.bin` of `application/octet-stream` on a recording whose model
+folds to `Perdix 3` or `Suunto Ocean` takes `libdivecomputer` and the descriptor the app writes for
+that model. Those are the computers the app downloads, so there the label is no guess; every other
+file stays unread. The Ocean's fallback start is the recording's, written off a merge's recording
+and where the file's name gives that minute, since a merge's start is one record's. A labelled
+file's fixes are read only where its dive has no position, the first file by id winning. Rejected:
+labelling from any recording's model, a guess in general; downloading those dives again, which costs
+their transfer.
 
 ## An import is its files imported one at a time
 
@@ -7443,7 +7467,8 @@ A dive's `changes` are the difference between two reads of it around the rolled-
 decide inside SQL, so a predicate over the plan would be a second account of the writer. The apply
 re-runs the pass from the held files, then sets each value entry to its reviewed `after`, because a
 fill never overwrites and an edit made in between would stand against what the diver approved.
-Rejected: writing the after-state directly, a second writer.
+Rejected: writing the after-state directly, a second writer. A reviewed dive gone since is planned
+as any import plans it, never held to its review; `review_unshown` says so.
 
 `review` and `notes` are served as stored, so an earlier build's row still answers. A change to any
 schema they embed bumps `REVIEW_SHAPE` and owes a call: migrate the stored rows or retire them.
@@ -7483,6 +7508,17 @@ place a computer before its first upload. Rejected: an order that applies only o
 the list and its footer would be untrue; ordering the unplaced by their earliest dive, under which a
 new computer with older dives moves ahead partway through its first download; a table of computers,
 owing a row on every path that creates a recording.
+
+## Which of a computer's dives the logbook holds is the server's answer
+
+`POST /dive-computers/known-dives` names which of the dives a computer lists the caller's logbook
+holds: by the uuid, through merges, or by a recording of the serial that `holds_listed_start`
+accepts, the predicate an import asks of a merge's recording too, so a wrong "held", which hides a
+dive from its diver, has one home. Each row also says whether the holding recording keeps the
+computer's `libdivecomputer` original, a merge's only by a file whose fallback start matches the
+listed one, since that download can still add it. It errs toward false: a wrong true leaves an
+original off for good, a wrong false costs one transfer. Rejected: listing recordings for the client
+to compare, writing the clock rule twice; leaving such a dive out, which changes what "held" means.
 
 ## An experimental feature's name is checked for its form, never against a list
 

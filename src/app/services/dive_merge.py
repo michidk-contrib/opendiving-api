@@ -8,9 +8,10 @@ strict gate deliberately never admits). Merging is the diver saying *these two a
 is the one thing no gate can decide from the data.
 
 **The earlier dive survives and the later one is soft-deleted**, after everything on it moves.
-Nothing here is undone: the later dive's uuid stops resolving, and a diver who merges the wrong
-pair has to rebuild the second dive by hand. That is the same bargain `DELETE /dive/{uuid}`
-already offers, and the route says so.
+Nothing here is undone: no read finds the later dive again, and a diver who merges the wrong pair
+has to rebuild the second dive by hand. That is the same bargain `DELETE /dive/{uuid}` already
+offers, and the route says so. The later dive's row keeps its uuid and names the dive it joined
+(`merged_into_id`), so to an import and to the dive-computer list that uuid is the merged dive.
 
 **Two branches, and the device test picks between them.** Two records of *one computer* fold
 into one recording - the later record's samples offset onto the earlier's clock, the gap where
@@ -142,7 +143,7 @@ def dive_figures(depths_cm: Sequence[int | None], *, folded: NormalizedProfile |
 def merged_notes(survivor: str, absorbed: str, *, dive_number: int) -> str:
     """The surviving dive's notes with the other dive's appended under a line naming it.
 
-    The other dive stops resolving, so its notes have nowhere else to go, and a diver who
+    No read finds the other dive again, so its notes have nowhere else to go, and a diver who
     wrote "lost the group at the wreck" on the second half wrote it about this dive. The
     heading is what keeps the two apart afterwards - appending them bare would read as one
     continuous entry that the diver never wrote.
@@ -248,6 +249,9 @@ async def merge_dives(db: AsyncSession, *, first: DiveReadInternal, second: Dive
     # dive stays where the files give none.
     await derive_dive_fixes(db, dive_id=survivor.id, clear=False)
 
+    # The absorbed row keeps its uuid and names the dive it became part of, which is what an
+    # import and the dive-computer list resolve that uuid to; every read still finds it deleted.
+    await db.execute(update(Dive).where(Dive.id == absorbed.id).values(merged_into_id=survivor.id))
     await crud_dives.delete(db=db, uuid=absorbed.uuid, commit=False)
 
     return MergedDives(survivor_id=survivor.id, survivor_uuid=survivor.uuid, removed_uuid=absorbed.uuid, folded=folded)
@@ -512,7 +516,7 @@ async def _move_links(db: AsyncSession, *, from_dive_id: int, to_dive_id: int, d
     and the two dives may name the same site or the same wing: the rows that would collide are
     left where they are and go down with the dive, and the rest are re-pointed and appended
     after the surviving dive's own. Deleting the collisions instead would buy nothing - the
-    dive they belong to is about to stop resolving.
+    dive they belong to is about to be deleted.
 
     `position` is rewritten rather than kept, so the surviving dive's own list stays first and
     the incoming one follows in its own order.

@@ -1,7 +1,7 @@
 """Revision `cc2976dc0dc2` run for real, against a database of its own
 (`tests/helpers/migrations.py`): every record a diver owns starts with no custom properties,
-and every dive in a review stored at shape 2 gains the empty list a dive read now gives it, the
-row recorded at shape 3.
+and every dive in a review stored at shape 3 gains the empty list a dive read now gives it, the
+row recorded at shape 4.
 
 Automatically skipped if no database is reachable - see `test_dive_check_constraints.py`.
 """
@@ -28,7 +28,7 @@ pytestmark = [
 ]
 
 _REVISION = "cc2976dc0dc2"
-_BELOW = "90c6f077a7d4"
+_BELOW = "438bcf2e2865"
 
 
 @pytest.fixture(scope="module")
@@ -65,16 +65,16 @@ _REVIEW: dict[str, Any] = {
 
 
 class TestTheUpgrade:
-    def test_a_review_at_shape_2_gains_the_empty_list_on_each_dive(self, scratch: tuple[str, Engine]) -> None:
+    def test_a_review_at_shape_3_gains_the_empty_list_on_each_dive(self, scratch: tuple[str, Engine]) -> None:
         name, engine = scratch
         with Session(engine) as db:
-            import_id = _import(db, shape=2, review=_REVIEW)
+            import_id = _import(db, shape=3, review=_REVIEW)
 
         migrate(name, "upgrade", _REVISION)
 
         with Session(engine) as db:
             shape, review = _stored(db, import_id)
-        assert shape == 3
+        assert shape == 4
         assert review["dives"][0]["dive"] == {**_DIVE, "custom_properties": []}
         assert review["dives"][1] == {"outcome": "skipped", "dive": None}
 

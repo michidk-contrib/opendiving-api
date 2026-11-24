@@ -6,8 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ...api.dependencies import get_current_user
 from ...core.db.database import async_get_db
 from ...core.exceptions.http_exceptions import UnprocessableEntityException
-from ...schemas.dive_computer import DiveComputerOrder, DiveComputerRead
-from ...services.dive_computers import RepeatedSerialError, list_dive_computers, set_order
+from ...schemas.dive_computer import DiveComputerListing, DiveComputerOrder, DiveComputerRead, KnownDive
+from ...services.dive_computers import RepeatedSerialError, known_dives, list_dive_computers, set_order
 
 router = APIRouter(tags=["dive-computers"])
 
@@ -62,3 +62,52 @@ async def write_dive_computer_order(
         raise UnprocessableEntityException(str(exc)) from exc
     await db.commit()
     return await list_dive_computers(db, user_id=current_user["id"])
+
+
+@router.post("/dive-computers/known-dives", response_model=list[KnownDive])
+async def read_dive_computer_known_dives(
+    request: Request,
+    listing: DiveComputerListing,
+    current_user: Annotated[dict, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(async_get_db)],
+) -> list[KnownDive]:
+    """Which of the dives a dive computer lists the caller's logbook already holds, and
+    whether each holding dive keeps the computer's original download of it, so a client
+    downloads only a dive the logbook lacks or one whose original it lacks.
+
+    `serial` is the computer's, and `dives` the dives it lists, each with the uuid the client
+    would give it and the start the computer lists for it. A listed dive is held when its uuid
+    is a dive of the caller's that is not deleted, or one merged into such a dive, which then
+    holds it; or when a dive of the caller's that is not deleted has a recording that names the
+    serial, compared trimmed and case-folded, and that recording either started within two
+    seconds of the listed start, or is one computer's two records of a dive merged into one
+    and the listed start falls from its start through the end of its samples. Two starts are
+    compared as instants where both carry a UTC offset, and as wall clocks where either does
+    not. Nothing else holds a dive: not the same start under another serial, a recording that
+    names no serial or no start, a deleted dive, or another account's. A dive the answer holds
+    is one an import of its download adds as no new dive; it adds the original where the
+    holding dive lacks it.
+
+    `has_original` is true when the recording that holds the listed dive - or, for a dive held
+    by its uuid, one of the holding dive's recordings that name the serial - keeps a
+    dive-computer original download, as the iOS app uploads it: on a recording of one record,
+    any such file; on one computer's two records merged into one, a file whose own start lies
+    within two seconds of the listed start, compared as instants, so a listed start without a
+    UTC offset or a file that records no start of its own answers false. An export under its
+    own format, a file on another recording or another dive, and a file uploaded without the
+    tag that names its reader do not count. It is false wherever the answer cannot be told
+    without reading a stored file, and a download of such a dive adds nothing where the file
+    is already there.
+
+    Answers one row for each listed dive the logbook holds, in the order listed and each uuid
+    once: the listed uuid, the uuid of the dive that holds it, and `has_original`. A listed
+    dive that is not held has no row, so where none is the answer is an empty list. Writes
+    nothing, and is not cached.
+
+    An empty serial or one longer than 64 characters, more than 2,000 dives, a member the
+    body does not declare, or a start that is a date alone is a 422.
+    """
+    # A POST because 2,000 uuids and starts do not fit a query string; it writes nothing. Not
+    # cached: nothing embeds the answer, and every write that creates a recording would owe it
+    # an invalidation.
+    return await known_dives(db, user_id=current_user["id"], serial=listing.serial, dives=listing.dives)

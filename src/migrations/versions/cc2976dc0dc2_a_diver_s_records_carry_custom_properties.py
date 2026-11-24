@@ -1,7 +1,7 @@
 """a diver's records carry custom properties
 
 Revision ID: cc2976dc0dc2
-Revises: 90c6f077a7d4
+Revises: 438bcf2e2865
 Create Date: 2026-11-17 08:17:49.058200
 
 One JSON column on each of the eight tables holding a record a diver owns, and on
@@ -9,8 +9,8 @@ One JSON column on each of the eight tables holding a record a diver owns, and o
 `[]` as the column is added.
 
 A dive read gained `custom_properties`, and an import's `review` stores dive reads and is served as
-stored. This writes `[]` into every dive of every review stored at shape 2 - what a read made then
-would have given, no dive having had a property before this revision - and records shape 3.
+stored. This writes `[]` into every dive of every review stored at shape 3 - what a read made then
+would have given, no dive having had a property before this revision - and records shape 4.
 `downgrade()` leaves the reviews: one carrying a member more is still what the earlier build serves.
 
 **Hidden dive-form sets gain `custom_properties` wherever they hide `sightings`**, in
@@ -28,7 +28,7 @@ from alembic import context, op
 
 # revision identifiers, used by Alembic.
 revision: str = "cc2976dc0dc2"
-down_revision: str | None = "90c6f077a7d4"
+down_revision: str | None = "438bcf2e2865"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -108,11 +108,11 @@ def upgrade() -> None:
     _rewrite_hidden_sets(with_custom_properties, only_containing=_SIGHTINGS)
     connection = op.get_bind()
     rows = connection.execute(
-        sa.text("SELECT id, review FROM logbook_import WHERE review_shape = 2 ORDER BY id").columns(
+        sa.text("SELECT id, review FROM logbook_import WHERE review_shape = 3 ORDER BY id").columns(
             id=sa.Integer, review=sa.JSON
         )
     ).all()
-    update = sa.text("UPDATE logbook_import SET review = :review, review_shape = 3 WHERE id = :id").bindparams(
+    update = sa.text("UPDATE logbook_import SET review = :review, review_shape = 4 WHERE id = :id").bindparams(
         sa.bindparam("review", type_=sa.JSON)
     )
     for row in rows:

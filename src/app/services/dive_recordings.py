@@ -2,7 +2,7 @@
 
 The **only** module that decides whether two records are the same recording, the same
 dive, or neither. Two halves, on the `dive_files.py` idiom: the top one is pure and DB-free
-(`same_device`, `devices_differ`, `delta_seconds`, the three gates), so the decisions worth
+(`same_device`, `devices_differ`, `delta_seconds`, the three gates, `holds_listed_start`), so the decisions worth
 testing are testable without a database; the bottom one persists.
 
 **Why any of this exists.** At most one export and one profile per dive would not survive
@@ -418,6 +418,30 @@ def holds_another_start(stored: RecordingFacts, file_starts: Sequence[tuple[date
     return any(
         delta_seconds(start, offset, stored.start_time, stored.utc_offset_minutes) > SAME_RECORDING_START_TOLERANCE
         for start, offset in file_starts
+    )
+
+
+def holds_listed_start(stored: RecordingFacts, start: datetime, offset: int | None) -> bool:
+    """Whether a stored recording of a computer holds a start that computer lists for a dive.
+
+    Within the same-recording tolerance of the recording's own start, on the gates' clock;
+    or, on a merge's recording, anywhere from its start through the end of its samples, which
+    is where the later record it absorbed began. The device is the caller's to have compared.
+
+    Asked by the dive-computer list and by logbook import alike (`dive_files.merge_holding`),
+    so a record the list holds is one an import adds no dive for. No gate asks the span clause:
+    a file of a merged span's later half would fill the merge from half a dive, and a record
+    the merge holds belongs to it instead.
+    """
+    if stored.start_time is None:
+        return False
+    delta = signed_delta_seconds(start, offset, stored.start_time, stored.utc_offset_minutes)
+    if abs(delta) <= SAME_RECORDING_START_TOLERANCE:
+        return True
+    return (
+        stored.merged
+        and stored.sampled_span is not None
+        and 0 <= delta <= stored.sampled_span / MILLISECONDS_PER_SECOND
     )
 
 
@@ -1104,6 +1128,7 @@ async def get_recordings_for_dives(db: AsyncSession, *, dive_ids: Sequence[int])
                 start_on_dive_axis=axis_starts[row.id],
                 files=files.get(row.id, []),
                 profile=profiles.get(row.id),
+                created_at=row.created_at,
                 updated_at=row.updated_at,
             )
         )
@@ -1159,6 +1184,7 @@ async def get_file_infos_for_recordings(
             DiveFile.byte_size,
             DiveFile.original_filename,
             DiveFile.parser_key,
+            DiveFile.created_at,
             DiveFile.updated_at,
             DiveFile.entry_latitude,
             DiveFile.entry_longitude,
@@ -1176,6 +1202,7 @@ async def get_file_infos_for_recordings(
                 byte_size=row.byte_size,
                 original_filename=row.original_filename,
                 parser_key=row.parser_key,
+                created_at=row.created_at,
                 updated_at=row.updated_at,
                 entry_latitude=row.entry_latitude,
                 entry_longitude=row.entry_longitude,
