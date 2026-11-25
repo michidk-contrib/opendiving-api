@@ -16,8 +16,7 @@ from uuid6 import uuid7
 
 from src.app import models
 from src.app.models.logbook_import import LogbookImport
-from tests.conftest import db_available
-from tests.helpers.generators import create_user
+from tests.conftest import db_available, unique_email, unique_username
 from tests.helpers.migrations import migrate, scratch_database, template_database
 
 pytestmark = [
@@ -45,7 +44,20 @@ def scratch(below: str) -> Iterator[tuple[str, Engine]]:
         yield database
 
 
-def _stored_recording(db: Session, diver: models.User) -> tuple[str, str]:
+def _user(db: Session) -> int:
+    """A user in this revision's schema; later model columns do not exist yet."""
+    user_id = db.execute(
+        text(
+            'INSERT INTO "user" (name, username, email, is_superuser, is_deleted, uuid, created_at) '
+            "VALUES ('Seed', :username, :email, false, false, :uuid, now()) RETURNING id"
+        ),
+        {"username": unique_username(), "email": unique_email(), "uuid": uuid7()},
+    ).scalar_one()
+    db.commit()
+    return int(user_id)
+
+
+def _stored_recording(db: Session, user_id: int) -> tuple[str, str]:
     """One recording holding one file, at `_RECORDED` and `_UPLOADED`: their uuids. The dive is
     written by the revision's own columns, which a later revision's model can outgrow."""
     dive_id = db.execute(
@@ -53,14 +65,14 @@ def _stored_recording(db: Session, diver: models.User) -> tuple[str, str]:
             "INSERT INTO dive (user_id, dive_number, start_time, submerged_time, notes, uuid, created_at, is_deleted) "
             "VALUES (:user_id, 1, :start, 1800, '', :uuid, :start, false) RETURNING id"
         ),
-        {"user_id": diver.id, "start": _RECORDED, "uuid": uuid7()},
+        {"user_id": user_id, "start": _RECORDED, "uuid": uuid7()},
     ).scalar_one()
-    recording = models.DiveRecording(dive_id=dive_id, user_id=diver.id, ordinal=0, start_time=_RECORDED)
+    recording = models.DiveRecording(dive_id=dive_id, user_id=user_id, ordinal=0, start_time=_RECORDED)
     db.add(recording)
     db.flush()
     recording.created_at = _RECORDED
     file = models.DiveFile(
-        user_id=diver.id,
+        user_id=user_id,
         recording_id=recording.id,
         dive_id=dive_id,
         sha256="c" * 64,
@@ -105,11 +117,11 @@ class TestTheUpgrade:
     def test_each_recording_and_file_reads_as_a_dive_read_now_gives_it(self, scratch: tuple[str, Engine]) -> None:
         name, engine = scratch
         with Session(engine) as db:
-            diver, other = create_user(db), create_user(db)
-            recording, file = _stored_recording(db, diver)
+            user_id, other = _user(db), _user(db)
+            recording, file = _stored_recording(db, user_id)
             someone_elses, their_file = _stored_recording(db, other)
             stored = LogbookImport(
-                user_id=diver.id,
+                user_id=user_id,
                 review_shape=2,
                 status="pending",
                 created_at=_IMPORTED,
@@ -135,9 +147,9 @@ class TestTheUpgrade:
     def test_a_review_at_the_new_shape_is_untouched(self, scratch: tuple[str, Engine]) -> None:
         name, engine = scratch
         with Session(engine) as db:
-            diver = create_user(db)
+            user_id = _user(db)
             review = _review((uuid7(), []))
-            stored = LogbookImport(user_id=diver.id, review_shape=3, status="applied", review=review)
+            stored = LogbookImport(user_id=user_id, review_shape=3, status="applied", review=review)
             db.add(stored)
             db.commit()
             stored_id = stored.id

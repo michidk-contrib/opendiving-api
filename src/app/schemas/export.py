@@ -211,7 +211,7 @@ class ExportDiver(PublicUUIDSchema):
     to each reader, so this app's crop rides the file's own `extensions.opendiving` and an
     import into this app keeps it. The avatar has no member.
 
-    `units`, the email opt-outs (`gear_service_emails`, `renewal_reminder_emails`,
+    `units`, `unit_preferences`, the email opt-outs (`gear_service_emails`, `renewal_reminder_emails`,
     `year_in_review_emails`), the dive form's hidden fields and presets, and the order of the
     diver's dive computers are application preferences rather than logbook data, so the format
     gives them no core member and they travel under this producer's key (spec §6.1). They are

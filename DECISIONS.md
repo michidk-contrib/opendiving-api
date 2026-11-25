@@ -2999,11 +2999,12 @@ metric (`max_depth` metres, `bottom_temperature` Celsius, `weight` kilograms, pr
 `sac_bar_per_min`); the client converts at display and entry. The API never converts: every dive
 read is `@cache`d under a user-scoped key, so a viewer-dependent response would need the preference
 in the key, and `?units=` adds a forked contract. `src/` holds no conversion code. Exports do not
-bend: `logbook.divejson` carries values as served (the preference rides on `ExportUser`),
-`dives.csv` keeps `_m`/`_kg`/`_bar` suffixes, UDDF is SI. One toggle, not per dimension (Shearwater
-Cloud, Garmin); per-dimension stays a later additive change. `UnitSystem` is a `StrEnum` over
-`VARCHAR(16)`, no `CHECK`. It sits on `UserRead` and `UserUpdate` (`extra="forbid"`), and `"units"`
-is in `UserUpdate.NON_NULLABLE_FIELDS`, pinned by
+bend: `logbook.divejson` carries values as served (the preferences ride on `ExportDiver`),
+`dives.csv` keeps `_m`/`_kg`/`_bar` suffixes, UDDF is SI. `units` is the preset; `unit_preferences`
+holds per-family overrides for depth, pressure, volume, weight and temperature. A family without an
+override follows `units`. `UnitSystem` is a `StrEnum` over `VARCHAR(16)`, no `CHECK`. It sits on
+`UserRead` and `UserUpdate` (`extra="forbid"`), and `"units"` is in
+`UserUpdate.NON_NULLABLE_FIELDS`, pinned by
 `test_update_explicit_nulls.py::test_the_declared_fields_match_the_table`. `server_default="metric"`
 is load-bearing: a `NOT NULL` column on a populated table needs a server-side default, and
 `default=` is invisible to autogenerate.
