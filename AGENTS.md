@@ -14,8 +14,9 @@ matching the wrapping by hand.
 
 - Location: `src/`
 
-- Credentials: `src/.env`. Never print credentials, tokens or private keys, including in local logs.
-  Redact secret values from diagnostics and command output.
+- Credentials: `src/.env`. Don't echo its values, or any other token or private key, into command
+  output, diagnostics, commits or PR text. The sign-in links the API logs when `SMTP_HOST` is unset
+  (*Auth flow* below) are a deliberate local-only exception.
 
 - **`cp src/.env.example src/.env` is not a working configuration, on purpose.** The template's
   `SECRET_KEY` is a published placeholder and startup rejects it in every environment — generate one
@@ -100,21 +101,18 @@ Test, lint, format and type-check commands are in `CONTRIBUTING.md`.
 
 ## Contribution checks
 
-Read `CONTRIBUTING.md` before editing. Identify companion web, iOS and install-bundle changes when
-an API contract or configuration changes, and state the migration and deployment order in the PR.
-Link companion PRs in both directions; a published branch is not an open companion PR.
+Read `CONTRIBUTING.md` before editing. For an API contract or configuration change, identify
+companion changes using its *Changes that span both repos* section and the install-bundle guidance
+above. State the migration and deployment order in the PR. A pushed companion branch with no open PR
+does not satisfy the cross-repository contribution rule.
 
-An adapter that reuses an API handler must preserve its contract. Derive upload cardinality and
-idempotency support from the operation that implements them. Reject excess file handles before
-mutation, and advertise retry protection only where the handler actually honors it. Keep exports
-streamed or bounded on disk, enforce quotas before or during consumption, and preserve filenames and
-media types. Test expiry and revocation at quota boundaries so owners have a working deletion or
-reclamation path.
+The MCP layer (`src/app/mcp/`) reuses API handlers and must keep their contract;
+`docs/mcp-design.md` says how. Read it before changing a tool.
 
 Account-preference changes cover persistence, omission, explicit nulls, replacement and reset
 semantics, including rejection without losing saved state. Trace exports, shared views, background
-jobs and older clients that consume the preference. Keep stored measurement units separate from
-display and entry preferences.
+jobs and older clients that consume the preference. For measurement preferences, read "Measurements
+are metric in the database and on the wire; `units` is who's looking" in `DECISIONS.md`.
 
 For review fixes, inspect review bodies, inline comments and discussion attachments. Reconcile each
 item with the current diff, rationale comments, documentation and PR description. State what remains
