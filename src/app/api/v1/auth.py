@@ -43,7 +43,7 @@ from ...core.exceptions.http_exceptions import (
     RateLimitException,
     UnauthorizedException,
 )
-from ...core.schemas import OnboardingTokenData
+from ...core.schemas import IdleTimeout, OnboardingTokenData
 from ...core.security import (
     TokenType,
     bearer_scheme,
@@ -104,7 +104,6 @@ from ...schemas.authentication_request import (
     AuthenticationRequestRead,
 )
 from ...schemas.user import UserBootstrapCreateInternal, UserCreateInternal, UserReadInternal
-from ...schemas.user_session import IdleTimeout
 from ...schemas.webauthn_credential import PasskeySignInOptions, PasskeySignInVerifyRequest
 from ...services.auth_service import (
     AuthenticatedUser,
@@ -199,11 +198,11 @@ async def _start_onboarding_or_sign_in(
     uninvited address and is signed into the onboarding token for the completion to count;
     an existing account signing in through either kind of link is simply signed in.
 
-    `idle_timeout` is the window a sign-in asked for, and only the six-digit code asks: it
-    is the one way in a native client can take. It reaches the first branch, and the third
-    signs it into the restore token, so the session `POST /auth/restore` starts is the one
-    the sign-in asked for. An onboarding handoff mints no session, and `POST /auth/complete`
-    starts a `standard` one.
+    `idle_timeout` is the window a sign-in asked for: both email routes and the passkey
+    route take it, for a native client, while Google is a browser's and passes `standard`.
+    The first branch starts the session with it; the second and third sign it into the onboarding and
+    restore tokens, so the session `POST /auth/complete` or `POST /auth/restore` starts is
+    the one the sign-in asked for.
     """
     if isinstance(outcome, AuthenticatedUser):
         tokens = await issue_tokens(
@@ -261,6 +260,7 @@ async def _start_onboarding_or_sign_in(
             name=outcome.name,
             avatar=outcome.avatar,
             via=via,
+            idle_timeout=idle_timeout,
         )
     )
     # "Registration-request creation": there is no registration table, so the onboarding
@@ -464,6 +464,11 @@ async def verify_email_link(
     `restore_token` for `POST /auth/restore`, when the account is inside its deletion grace
     period - in which case nothing is signed in and nothing about the account changes.
 
+    `idle_timeout` chooses how long the resulting session may sit unused before it ends:
+    `standard` or `extended`, each a window the instance sets. On a `deletion_pending`
+    outcome it is the window of the session `POST /auth/restore` then starts, and on
+    `onboarding_required` the window of the one `POST /auth/complete` starts.
+
     The token is single-use. 401 for a link that was already used, superseded by a newer
     request, expired, or never issued, and `detail` says which. The link is spent even when
     the outcome is `deletion_pending` or a refusal.
@@ -505,7 +510,9 @@ async def verify_email_link(
 
     context = RequestContext.from_request(request)
     outcome = await resolve_identity(db=db, provider="email", email=auth_request["email"], context=context)
-    return await _start_onboarding_or_sign_in(response, outcome, db=db, context=context, via=auth_request.get("via"))
+    return await _start_onboarding_or_sign_in(
+        response, outcome, db=db, context=context, via=auth_request.get("via"), idle_timeout=body.idle_timeout
+    )
 
 
 @router.post("/email/verify-code", response_model=AuthOutcome)
@@ -523,10 +530,9 @@ async def verify_email_code(
     `authenticated`, `onboarding_required` or `deletion_pending`, with the same tokens and
     the same 403 on an invite-only instance.
 
-    `idle_timeout` chooses how long the resulting session may sit unused before it ends:
-    `standard` or `extended`, each a window the instance sets. On a `deletion_pending`
-    outcome it is the window of the session `POST /auth/restore` then starts. Only this
-    operation takes it.
+    `idle_timeout` is taken as the link takes it: `standard` or `extended`, the window of the
+    session this starts, or of the one `POST /auth/restore` or `POST /auth/complete` then
+    starts.
 
     Every rejection is a 401 with the same `detail`, "This code is invalid or has expired.":
     wrong digits, a `request_id` naming no request, a request that expired or was superseded
@@ -680,11 +686,11 @@ async def auth_with_google(
 
 @router.post("/passkey/options", response_model=PasskeySignInOptions)
 async def passkey_sign_in_options(request: Request) -> PasskeySignInOptions:
-    """Step 1 of signing in with a passkey: a challenge and the assertion options the browser
-    hands to `navigator.credentials.get()`.
+    """Step 1 of signing in with a passkey: a challenge and the assertion options the client
+    hands to its WebAuthn get() ceremony.
 
     Anonymous, and rate limited per IP. The request names no account and takes no
-    identifier: `allowCredentials` is empty, and the assertion the browser produces carries
+    identifier: `allowCredentials` is empty, and the assertion the client gets back carries
     the credential that names one. `flow_id` identifies the challenge and goes back with the
     assertion to `POST /auth/passkey/verify`; a challenge is good for one attempt.
 
@@ -724,10 +730,14 @@ async def passkey_sign_in_verify(
     that registered the credential.
 
     Anonymous, and rate limited per IP. `flow_id` is the one the options came with and
-    `credential` is the assertion as the browser returned it. The outcome is `authenticated`,
-    with an access token in the body and a `refresh_token` cookie, or `deletion_pending`,
-    with a `restore_token` for `POST /auth/restore`, when the account is inside its deletion
-    grace period; never `onboarding_required`, since a passkey exists only on an account.
+    `credential` is the assertion as the client's WebAuthn ceremony returned it, in the
+    specification's JSON. The outcome is `authenticated`, with an access token in the body
+    and a `refresh_token` cookie, or `deletion_pending`, with a `restore_token` for
+    `POST /auth/restore`, when the account is inside its deletion grace period; never
+    `onboarding_required`, since a passkey exists only on an account.
+
+    `idle_timeout` is taken as the email routes take it: `standard` or `extended`, the window
+    of the session this starts, or of the one `POST /auth/restore` then starts.
 
     The challenge is spent on the attempt, success or not, so a failed attempt starts again
     from `POST /auth/passkey/options`. Every failure - an unknown credential, an expired or
@@ -748,7 +758,7 @@ async def passkey_sign_in_verify(
 
     context = RequestContext.from_request(request)
     outcome = await finish_sign_in(db=db, flow_id=body.flow_id, credential=body.credential, context=context)
-    return await _start_onboarding_or_sign_in(response, outcome, db=db, context=context)
+    return await _start_onboarding_or_sign_in(response, outcome, db=db, context=context, idle_timeout=body.idle_timeout)
 
 
 @router.post("/complete", response_model=AuthOutcome)
@@ -763,7 +773,8 @@ async def complete_profile(
     Takes the `onboarding_token` from an `onboarding_required` outcome, with the `name` and
     `username` the account starts with; the address is the one the token was issued for.
     Rate limited per IP. The outcome is `authenticated`, with an access token in the body
-    and a `refresh_token` cookie on the response.
+    and a `refresh_token` cookie on the response. The session may sit unused for the window
+    the sign-in that issued the token asked for.
 
     401 for an onboarding token that is invalid, expired, or already used: the token is
     single-use, so a second call with it creates nothing. 422 when `username` is taken or
@@ -914,7 +925,14 @@ async def complete_profile(
     # never create (or attempt to create) a second account.
     await blacklist_token(body.onboarding_token, db)
 
-    tokens = await issue_tokens(response, created_user.uuid, db=db, context=context, user_id=created_user.id)
+    tokens = await issue_tokens(
+        response,
+        created_user.uuid,
+        db=db,
+        context=context,
+        user_id=created_user.id,
+        idle_timeout=token_data.idle_timeout,
+    )
     return AuthOutcome(status="authenticated", **tokens.body())
 
 

@@ -423,6 +423,7 @@ class TestWhatUddfCannotHold:
         assert document["diver"]["extensions"] == {
             "opendiving": {
                 "units": "metric",
+                "unit_preferences": {},
                 "gear_service_emails": True,
                 "renewal_reminder_emails": True,
                 "year_in_review_emails": True,
