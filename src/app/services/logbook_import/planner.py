@@ -42,7 +42,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 
 from divejson import IN_WATER_DEPTH, InWater
 from pydantic import EmailStr, TypeAdapter, ValidationError
@@ -73,8 +73,7 @@ from ...models.tag import Tag
 from ...models.trip import Trip
 from ...models.user import User
 from ...schemas.certification import CertificationAgency, CertificationSide
-from ...schemas.contact import ADDRESS_FIELDS, CONTACT_ADDRESS_PREFIX, canonical_roles, check_website
-from ...schemas.custom_property import CUSTOM_PROPERTIES_MAX, CustomProperty
+from ...schemas.contact import ADDRESS_FIELDS, CONTACT_ADDRESS_PREFIX, canonical_roles
 from ...schemas.dive_conditions import DiveConditionsRead
 from ...schemas.dive_profile import MILLISECONDS_PER_SECOND
 from ...schemas.dive_site import (
@@ -85,8 +84,9 @@ from ...schemas.dive_site import (
     canonical_other_names,
     identifier_problem,
 )
-from ...schemas.export import CUSTOM_PROPERTIES_EXTENSION, DIVEJSON_PRODUCER_KEY
+from ...schemas.export import DIVEJSON_PRODUCER_KEY
 from ...schemas.gear_item import CylinderMaterial, GearType
+from ...schemas.link import LINK_LABEL_MAX, LINK_URL_MAX, LINKS_MAX, Link
 from ...schemas.location import DIVE_SITE_LOCATION_PREFIX, LOCATION_FIELDS
 from ...schemas.logbook_import import (
     ImportCertification,
@@ -97,12 +97,14 @@ from ...schemas.logbook_import import (
     ImportCourse,
     ImportCylinder,
     ImportDive,
+    ImportDiver,
     ImportDiveSite,
     ImportFileReport,
     ImportGearItem,
     ImportGearServiceRecord,
     ImportGearServiceSchedule,
     ImportGearSet,
+    ImportLink,
     ImportLocation,
     ImportMemberNotKept,
     ImportNote,
@@ -983,39 +985,6 @@ class _Planner:
     def _dropped(self, collection: str, record_uuid: uuid_pkg.UUID, reason: str) -> None:
         self._note(ImportNoteCode.VALUE_DROPPED, reason, collection=collection, uuid=record_uuid)
 
-    def _custom_properties(self, collection: str, record: _Extended) -> list[dict[str, str]]:
-        """The custom properties this app's writer put on a record, held to what a write takes.
-
-        A property a write would refuse - an empty key or value, one too long, a key already
-        given, one past the most a record holds - is dropped and reported, the rest kept in
-        order. Anything else under the key is another writer's and reads as none (spec §5.5).
-        """
-        entry = _producer_entry(record, CUSTOM_PROPERTIES_EXTENSION)
-        if not isinstance(entry, list):
-            return []
-        kept: list[dict[str, str]] = []
-        seen: set[str] = set()
-        dropped = 0
-        for item in entry:
-            try:
-                prop = CustomProperty.model_validate(item)
-            except ValidationError:
-                dropped += 1
-                continue
-            if prop.key.casefold() in seen or len(kept) == CUSTOM_PROPERTIES_MAX:
-                dropped += 1
-                continue
-            seen.add(prop.key.casefold())
-            kept.append(prop.model_dump())
-        if dropped:
-            self._dropped(
-                collection,
-                record.uuid,
-                f"{dropped} of its custom properties could not be kept: each needs a key and a value, "
-                f"a key once, and at most {CUSTOM_PROPERTIES_MAX} of them",
-            )
-        return kept
-
     # ------------------------------------------------------------------ lookups
 
     async def _rows_by_uuid(self, model: Any, uuids: Sequence[uuid_pkg.UUID]) -> dict[uuid_pkg.UUID, _ExistingRow]:
@@ -1594,7 +1563,6 @@ class _Planner:
 
         latitude, longitude = self._position(collection, contact.uuid, contact.position, "contact's")
         record.values = {
-            "custom_properties": self._custom_properties("contacts", contact),
             "user_id": self._user_id,
             "name": name,
             # Already stripped of values outside the vocabulary by the reader (§5.6); a set,
@@ -1602,7 +1570,7 @@ class _Planner:
             "roles": [role.value for role in canonical_roles(contact.roles or [])],
             "phone": contact.phone,
             "email": self._contact_email(contact),
-            "website": self._contact_website(contact),
+            "links": self._links(collection, contact.uuid, contact.links),
             **self._address(contact),
             "latitude": latitude,
             "longitude": longitude,
@@ -1614,16 +1582,35 @@ class _Planner:
     def _contact_email(self, contact: ImportContact) -> str | None:
         return self._email("contacts", contact.uuid, contact.email)
 
-    def _contact_website(self, contact: ImportContact) -> str | None:
-        """The website as an absolute `http(s)` URL, or `None` and a note - no scheme is
-        guessed, a bare host being as likely a typo as a site."""
-        try:
-            return check_website(contact.website)
-        except ValueError:
+    def _links(self, collection: str, record_uuid: uuid_pkg.UUID, entries: list[ImportLink]) -> list[dict[str, Any]]:
+        """A record's links as the app's write shape would store them, in the document's order.
+
+        An entry the write shape refuses is dropped with a note - no scheme is guessed, a bare
+        host being as likely a typo as a site - and an address named twice is kept once. Only
+        then is the list cut at the app's bound, each entry past it noted, so a duplicate
+        never costs a distinct address its place.
+        """
+        kept: list[Link] = []
+        seen: set[str] = set()
+        for position, entry in enumerate(entries, start=1):
+            try:
+                link = Link.model_validate(entry.model_dump())
+            except ValidationError:
+                self._dropped(
+                    collection,
+                    record_uuid,
+                    f"Link {position} was not an absolute http or https address of at most {LINK_URL_MAX} "
+                    f"characters with no whitespace and a label of at most {LINK_LABEL_MAX}, and was dropped",
+                )
+                continue
+            if link.url not in seen:
+                seen.add(link.url)
+                kept.append(link)
+        for link in kept[LINKS_MAX:]:
             self._dropped(
-                "contacts", contact.uuid, "The website was not an absolute http or https address, and was dropped"
+                collection, record_uuid, f"The link to {link.url} was past this app's {LINKS_MAX}, and was dropped"
             )
-            return None
+        return [link.model_dump() for link in kept[:LINKS_MAX]]
 
     def _address(self, contact: ImportContact) -> dict[str, Any]:
         """The address as its five columns, every one named, or none of it without a country
@@ -1681,7 +1668,7 @@ class _Planner:
                 **{f"{CONTACT_ADDRESS_PREFIX}{field}": None for field in ADDRESS_FIELDS},
                 "phone": None,
                 "email": None,
-                "website": None,
+                "links": [],
                 "notes": "",
                 "created_at": datetime.now(UTC),
             },
@@ -1756,11 +1743,11 @@ class _Planner:
             return record
 
         record.values = {
-            "custom_properties": self._custom_properties("people", person),
             "user_id": self._user_id,
             "name": name,
             "email": self._email(collection, person.uuid, person.email),
             "phone": person.phone,
+            "links": self._links(collection, person.uuid, person.links),
             "notes": self._notes_text(collection, person.uuid, person.notes),
             "connected_user_id": await self._account_connection(person, account_uuid, account),
             "created_at": self._created_at(person.created_at),
@@ -1890,6 +1877,7 @@ class _Planner:
                 "name": name,
                 "email": None,
                 "phone": None,
+                "links": [],
                 "notes": "",
                 "connected_user_id": None,
                 "created_at": datetime.now(UTC),
@@ -1934,9 +1922,9 @@ class _Planner:
         record.values = {
             "user_id": self._user_id,
             "name": name,
+            "links": self._links("trips", trip.uuid, trip.links),
             "notes": self._notes_text("trips", trip.uuid, trip.notes),
             "created_at": self._created_at(trip.created_at),
-            "custom_properties": self._custom_properties("trips", trip),
         }
         record.children = {
             "parts": self._plan_trip_parts(trip),
@@ -2011,7 +1999,6 @@ class _Planner:
             self._dropped("courses", course.uuid, "The end date preceded the start date, and was dropped")
             end_date = None
         record.values = {
-            "custom_properties": self._custom_properties("courses", course),
             "user_id": self._user_id,
             "name": name,
             "agency": agency,
@@ -2020,6 +2007,7 @@ class _Planner:
             "start_date": course.starts_on,
             "end_date": end_date,
             "instructor_number": course.instructor_number,
+            "links": self._links("courses", course.uuid, course.links),
             "notes": self._notes_text("courses", course.uuid, course.notes),
             "created_at": self._created_at(course.created_at),
         }
@@ -2132,7 +2120,6 @@ class _Planner:
         )
         record.children = {
             "notes": self._notes_text("sites", site.uuid, site.notes),
-            "custom_properties": self._custom_properties("sites", site),
             "tags": self._tag_names(site.tags, collection="sites", record_uuid=site.uuid),
         }
         return record
@@ -2213,7 +2200,6 @@ class _Planner:
         }
         record.children = {
             "notes": self._notes_text("sites", site.uuid, site.notes),
-            "custom_properties": self._custom_properties("sites", site),
             "tags": self._tag_names(site.tags, collection="sites", record_uuid=site.uuid),
         }
         return record
@@ -2313,11 +2299,11 @@ class _Planner:
             material = None
         vessel = self._bounded("gear", item.uuid, item, _GEAR_BOUNDS)
         record.values = {
-            "custom_properties": self._custom_properties("gear", item),
             "user_id": self._user_id,
             "name": name,
             "brand": brand,
             "type": gear_type,
+            "links": self._links("gear", item.uuid, item.links),
             "notes": self._notes_text("gear", item.uuid, item.notes),
             "rented": bool(item.rented),
             "is_archived": bool(item.archived),
@@ -2366,7 +2352,6 @@ class _Planner:
             self._dropped("gear_sets", gear_set.uuid, "A negative ballast weight was dropped")
             weight = None
         record.values = {
-            "custom_properties": self._custom_properties("gear_sets", gear_set),
             "user_id": self._user_id,
             "name": name,
             "weight": weight,
@@ -2587,7 +2572,6 @@ class _Planner:
             return record
 
         record.values = {
-            "custom_properties": self._custom_properties("certifications", certification),
             "user_id": self._user_id,
             "agency": agency[0],
             "agency_other": agency[1],
@@ -3047,7 +3031,6 @@ class _Planner:
         start_time, offset_minutes, date_only = split_dive_start_time(dive.started_at)
         number = bounded.get("number")
         record.values = {
-            "custom_properties": self._custom_properties("dives", dive),
             "user_id": self._user_id,
             # A dive number is the diver's own numbering and `NOT NULL` here. Absent - or
             # dropped by the bound above - the dive takes the number the dive form would
@@ -3658,14 +3641,7 @@ def _carried_conditions(dive: ImportDive) -> DiveConditionsRead | None:
         return None
 
 
-class _Extended(Protocol):
-    """A document record that may carry `extensions`."""
-
-    uuid: Any
-    extensions: dict[str, Any] | None
-
-
-def _producer_entry(record: _Extended, member: str) -> Any:
+def _producer_entry(record: ImportStoredFile | ImportPerson | ImportDiver | ImportDive, member: str) -> Any:
     """One value out of this producer's extension entry (spec §5.5).
 
     Defensive about the shape all the way down: `extensions` is typed as "any JSON value

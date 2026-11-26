@@ -14,8 +14,8 @@ from ..core.schemas import (
     StoredVocabulary,
     Trimmed,
 )
-from .custom_property import CustomPropertiesRead, CustomPropertiesUpdate, CustomPropertiesWrite
 from .gear_service import GearServiceScheduleInfo
+from .link import LinksRead, LinksUpdate, LinksWrite
 
 
 class GearType(StrEnum):
@@ -142,7 +142,7 @@ class GearItemInfo(PublicUUIDSchema):
     material: StoredVocabulary | None = None
 
 
-class GearItemRead(GearItemBase, CustomPropertiesRead, PublicUUIDSchema):
+class GearItemRead(GearItemBase, PublicUUIDSchema):
     """Public representation of a gear item, keyed by its opaque `uuid` rather than the
     sequential internal `id` (which is never exposed over the API).
     """
@@ -176,10 +176,11 @@ class GearItemRead(GearItemBase, CustomPropertiesRead, PublicUUIDSchema):
         list[GearServiceScheduleInfo],
         Field(default_factory=list, description="Service schedules attached to this item"),
     ]
+    links: LinksRead
     created_at: datetime
 
 
-class GearItemReadInternal(GearItemBase, CustomPropertiesRead, PublicUUIDSchema):
+class GearItemReadInternal(GearItemBase, PublicUUIDSchema):
     """Mirrors the actual `gear_item` table columns (integer PK/FK), for server-side
     lookups only - never returned directly over the API (use `GearItemRead` for the
     public shape, which additionally resolves `user_id` to the owning user's `uuid`).
@@ -196,6 +197,7 @@ class GearItemReadInternal(GearItemBase, CustomPropertiesRead, PublicUUIDSchema)
     archived_at: datetime | None = None
     dive_count: int = 0
     dive_time: int = 0
+    links: LinksRead
     created_at: datetime
 
 
@@ -207,22 +209,24 @@ VesselWorkingPressure = Annotated[
 ]
 
 
-class GearItemCreate(GearItemBase, CustomPropertiesWrite):
+class GearItemCreate(GearItemBase):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     volume: VesselVolume
     working_pressure: VesselWorkingPressure
+    links: LinksWrite
 
 
-class GearItemCreateInternal(GearItemBase, CustomPropertiesWrite):
+class GearItemCreateInternal(GearItemBase):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     user_id: int
     volume: VesselVolume
     working_pressure: VesselWorkingPressure
+    links: LinksWrite
 
 
-class GearItemUpdate(CustomPropertiesUpdate, RejectsExplicitNulls):
+class GearItemUpdate(RejectsExplicitNulls):
     """Partial update. `is_archived` doubles as the archive/unarchive control - the API
     derives `archived_at` from it rather than letting callers set the timestamp directly.
     """
@@ -232,7 +236,7 @@ class GearItemUpdate(CustomPropertiesUpdate, RejectsExplicitNulls):
     # `brand` and `type` are genuinely nullable, so clearing either is a real edit -
     # `patch_gear_item` reads an explicit `brand` null through `model_fields_set` when it
     # re-checks (brand, name) uniqueness.
-    NON_NULLABLE_FIELDS: ClassVar[tuple[str, ...]] = ("name", "notes", "rented", "is_archived", "custom_properties")
+    NON_NULLABLE_FIELDS: ClassVar[tuple[str, ...]] = ("name", "notes", "rented", "is_archived", "links")
 
     name: Annotated[Annotated[str, Trimmed] | None, Field(max_length=255, default=None, description=_NAME_DESCRIPTION)]
     brand: Annotated[GearBrand | None, BlankIsNone, Field(default=None, description=_BRAND_DESCRIPTION)]
@@ -245,6 +249,7 @@ class GearItemUpdate(CustomPropertiesUpdate, RejectsExplicitNulls):
     volume: VesselVolume
     working_pressure: VesselWorkingPressure
     material: Annotated[CylinderMaterial | None, Field(default=None, description=_MATERIAL_DESCRIPTION)]
+    links: LinksUpdate
 
 
 class GearItemUpdateInternal(GearItemUpdate):
