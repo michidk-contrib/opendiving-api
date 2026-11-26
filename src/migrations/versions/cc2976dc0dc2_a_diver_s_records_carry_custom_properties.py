@@ -1,7 +1,7 @@
 """a diver's records carry custom properties
 
 Revision ID: cc2976dc0dc2
-Revises: 438bcf2e2865
+Revises: a8c9743e21b0
 Create Date: 2026-11-17 08:17:49.058200
 
 One JSON column on each of the eight tables holding a record a diver owns, and on
@@ -28,7 +28,7 @@ from alembic import context, op
 
 # revision identifiers, used by Alembic.
 revision: str = "cc2976dc0dc2"
-down_revision: str | None = "438bcf2e2865"
+down_revision: str | None = "a8c9743e21b0"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
