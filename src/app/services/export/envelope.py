@@ -81,6 +81,7 @@ from ...schemas.export import (
     ExportGearSet,
     ExportGenerator,
     ExportInsurance,
+    ExportLink,
     ExportLocation,
     ExportPerson,
     ExportPersonReference,
@@ -207,6 +208,7 @@ def _export_course(bundle: ExportBundle, course: Course) -> ExportCourse:
         instructor_number=course.instructor_number,
         contact_uuid=None if contact is None else contact.uuid,
         people=_people(bundle.people_for(course)),
+        links=_links(course.links),
         notes=_text(course.notes),
         created_at=course.created_at,
         extensions=_extensions(course.custom_properties),
@@ -232,6 +234,7 @@ def _export_person(bundle: ExportBundle, person: Person) -> ExportPerson:
         name=person.name,
         email=_filled(person.email),
         phone=_filled(person.phone),
+        links=_links(person.links),
         notes=_text(person.notes),
         created_at=person.created_at,
         extensions=_extensions(person.custom_properties, user_uuid=connected),
@@ -254,7 +257,7 @@ def _export_contact(contact: Contact) -> ExportContact:
         roles=roles or None,
         phone=_filled(contact.phone),
         email=_filled(contact.email),
-        website=_filled(contact.website),
+        links=_links(contact.links),
         address=None if address is None else ExportAddress(**address.model_dump()),
         position=_position(contact.latitude, contact.longitude),
         notes=_text(contact.notes),
@@ -375,6 +378,13 @@ def _mixture(mixture: DiveMixtureRead) -> ExportCylinder:
         usage=_sayable(mixture.usage, TankUsage),
         gear_uuid=None if mixture.gear_item is None else mixture.gear_item.uuid,
     )
+
+
+def _links(stored: list[dict[str, Any]]) -> list[ExportLink] | None:
+    """A record's links as stored, or absence for none, without the write's check: what it
+    would refuse is only a contact's first link filled from a stored website holding
+    whitespace or a control character, and that address is the diver's to keep."""
+    return [ExportLink(url=entry["url"], label=entry.get("label")) for entry in stored] or None
 
 
 def _filled(value: str | None) -> str | None:
@@ -510,6 +520,7 @@ def _trip(bundle: ExportBundle, trip: Trip, parts: list[TripPartRead]) -> Export
         name=trip.name,
         parts=[_trip_part(part) for part in parts],
         people=_people(bundle.people_for(trip)),
+        links=_links(trip.links),
         notes=_text(trip.notes),
         created_at=trip.created_at,
         extensions=_extensions(trip.custom_properties),
@@ -798,6 +809,7 @@ def _collections(bundle: ExportBundle, paths: ArchivePaths | None) -> list[tuple
                     name=item.name,
                     brand=item.brand,
                     type=_sayable(item.type, GearType),
+                    links=_links(item.links),
                     notes=_text(item.notes),
                     rented=item.rented,
                     archived=item.is_archived,
